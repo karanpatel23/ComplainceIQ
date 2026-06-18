@@ -9,6 +9,8 @@ test("API requires auth and blocks cross-organization access", async () => {
   process.env.NODE_ENV = "test";
   process.env.REPOSITORY_BACKEND = "file";
   process.env.FILE_REPOSITORY_PATH = path.join(dir, "db.json");
+  process.env.UPLOAD_DIR = path.join(dir, "private-storage");
+  process.env.MAX_UPLOAD_MB = "5";
   process.env.SESSION_SECRET = "test-session-secret-with-enough-length";
 
   const { server, repo } = await import("../apps/api/src/server.js");
@@ -21,6 +23,20 @@ test("API requires auth and blocks cross-organization access", async () => {
     const orgA = await repo.createOrganization({ name: "Tenant A" });
     const orgB = await repo.createOrganization({ name: "Tenant B" });
     const user = await repo.createUser({ organizationId: orgA.id, email: "admin@example.com", passwordHash: await hashPassword("Password#2026"), name: "Admin", role: "admin", isActive: true });
+    const userB = await repo.createUser({ organizationId: orgB.id, email: "other@example.com", passwordHash: await hashPassword("Password#2026"), name: "Other Admin", role: "admin", isActive: true });
+    const facility = await repo.createFacility({
+      organizationId: orgA.id,
+      name: "Plant A",
+      country: "US",
+      stateProvince: "OH",
+      region: "OH",
+      jurisdictionCode: "US-OH",
+      industry: "industrial_manufacturing",
+      facilityType: "fabrication",
+      employeeCount: 50,
+      hazardProfile: { machinery: true, lockoutTagout: true },
+      archived: false
+    });
     const otherFacility = await repo.createFacility({
       organizationId: orgB.id,
       name: "Other Plant",
@@ -48,6 +64,60 @@ test("API requires auth and blocks cross-organization access", async () => {
 
     const denied = await fetch(`${base}/api/facilities/${otherFacility.id}`, { headers: { cookie } });
     assert.equal(denied.status, 403);
+
+    const upload = await fetch(`${base}/api/evidence/upload`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({
+        facilityId: facility.id,
+        title: "LOTO procedure",
+        evidenceType: "loto_procedures",
+        status: "accepted",
+        contentBase64: Buffer.from("loto procedure").toString("base64"),
+        fileName: "loto.txt"
+      })
+    });
+    assert.equal(upload.status, 201);
+    const evidence = await upload.json();
+
+    const evidenceDownload = await fetch(`${base}/api/evidence/${evidence.id}/download`, { headers: { cookie } });
+    assert.equal(evidenceDownload.status, 200);
+    assert.equal(await evidenceDownload.text(), "loto procedure");
+
+    const generated = await fetch(`${base}/api/audit-readiness/reviews`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ facilityId: facility.id })
+    });
+    assert.equal(generated.status, 201);
+    const generatedBody = await generated.json();
+    assert.ok(generatedBody.review.scoreExplanation.length > 0);
+    assert.ok((await repo.getEvidenceMatches(orgA.id, facility.id)).some((match) => match.evidenceId === evidence.id));
+
+    const packetExport = await fetch(`${base}/api/audit-packets/export`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ reviewId: generatedBody.review.id })
+    });
+    assert.equal(packetExport.status, 201);
+    const { packet } = await packetExport.json();
+
+    const packetDownload = await fetch(`${base}/api/audit-packets/${packet.id}/download`, { headers: { cookie } });
+    assert.equal(packetDownload.status, 200);
+    assert.equal((await packetDownload.arrayBuffer()).byteLength > 4, true);
+
+    const loginB = await fetch(`${base}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: userB.email, password: "Password#2026" })
+    });
+    assert.equal(loginB.status, 200);
+    const cookieB = loginB.headers.get("set-cookie").split(";")[0];
+
+    const deniedEvidence = await fetch(`${base}/api/evidence/${evidence.id}/download`, { headers: { cookie: cookieB } });
+    assert.equal(deniedEvidence.status, 403);
+    const deniedPacket = await fetch(`${base}/api/audit-packets/${packet.id}/download`, { headers: { cookie: cookieB } });
+    assert.equal(deniedPacket.status, 403);
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }

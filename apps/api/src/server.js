@@ -188,12 +188,12 @@ async function listEvidence(res, user, facilityId) {
 
 async function createEvidence(req, res, user, allowsFile) {
   const body = await readJson(req);
-  let fileReference = body.fileReference || null;
+  const facility = await requireFacility(user.organizationId, body.facilityId);
+  let fileReference = null;
   if (allowsFile && body.contentBase64) {
     const saved = await storage.saveBuffer(Buffer.from(String(body.contentBase64), "base64"), body.fileName || "evidence.bin");
     fileReference = saved.fileReference;
   }
-  const facility = await requireFacility(user.organizationId, body.facilityId);
   const evidence = await repo.createEvidence(parseEvidenceInput({ ...body, fileReference, country: facility.country, region: facility.region }, user.organizationId, user.id));
   await audit(user, facility.id, "evidence.created", "evidence", evidence.id, { evidenceType: evidence.evidenceType });
   sendJson(res, { status: 201, body: evidence });
@@ -206,7 +206,8 @@ async function getEvidence(res, user, id) {
 
 async function updateEvidence(req, res, user, id) {
   const existing = await requireEvidence(user.organizationId, id);
-  const updates = parseEvidenceInput({ ...existing, ...(await readJson(req)) }, user.organizationId, user.id);
+  const body = await readJson(req);
+  const updates = parseEvidenceInput({ ...existing, ...body, fileReference: existing.fileReference, facilityId: existing.facilityId, country: existing.country, region: existing.region }, user.organizationId, user.id);
   const evidence = await repo.updateEvidence(user.organizationId, id, updates);
   await audit(user, evidence.facilityId, "evidence.updated", "evidence", evidence.id, { status: evidence.status });
   sendJson(res, { status: 200, body: evidence });
@@ -246,6 +247,7 @@ async function createReview(req, res, user) {
     scoreExplanation: generated.scoreExplanation,
     summary: generated.summary,
     generatedByUserId: user.id,
+    evidenceMatches: generated.evidenceMatches,
     gapRows: generated.gapRows,
     findings: generated.findings,
     actionPlan: generated.actionPlan
@@ -311,15 +313,20 @@ async function downloadPacket(res, user, id) {
 
 async function requestExpertReview(req, res, user) {
   const body = await readJson(req);
+  const facility = body.facilityId ? await requireFacility(user.organizationId, body.facilityId) : null;
+  const review = body.reviewId ? await requireReview(user.organizationId, body.reviewId) : null;
+  if (facility && review && review.facilityId !== facility.id) {
+    throw validationError("reviewId must belong to the requested facility");
+  }
   const item = await repo.createExpertReview({
     organizationId: user.organizationId,
-    facilityId: body.facilityId || null,
-    reviewId: body.reviewId || null,
+    facilityId: facility?.id || review?.facilityId || null,
+    reviewId: review?.id || null,
     requestedByUserId: user.id,
     status: "requested",
     expertNotes: body.expertNotes || null
   });
-  await audit(user, body.facilityId || null, "expert_review.requested", "expert_review", item.id, {});
+  await audit(user, item.facilityId || null, "expert_review.requested", "expert_review", item.id, {});
   sendJson(res, { status: 201, body: item });
 }
 

@@ -36,7 +36,8 @@ export class LocalPrivateStorage {
 
   safePath(fileReference) {
     const abs = path.resolve(this.uploadDir, fileReference);
-    if (!abs.startsWith(this.uploadDir)) {
+    const relative = path.relative(this.uploadDir, abs);
+    if (relative.startsWith("..") || path.isAbsolute(relative)) {
       throw new Error("Invalid private file reference");
     }
     return abs;

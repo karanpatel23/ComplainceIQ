@@ -5,6 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import { FileRepository } from "../packages/db/src/file-repository.js";
 import { parseFacilityInput, parseEvidenceInput } from "../packages/shared/src/index.js";
+import { generateReview } from "../packages/rules/src/index.js";
 
 async function repoAt(file) {
   const repo = new FileRepository(file);
@@ -34,26 +35,43 @@ test("file repository persists facilities, evidence, and reviews after reinitial
     evidenceType: "loto_procedures",
     status: "accepted"
   }, org.id, user.id));
+  const generated = generateReview({ facility, evidence: [evidence], now: new Date("2026-06-18T12:00:00Z") });
   const review = await repo.createReview({
     organizationId: org.id,
     facilityId: facility.id,
-    rulesPackId: "us-industrial-manufacturing-starter",
-    country: "US",
-    region: "MI",
-    readinessScore: 80,
-    scoreExplanation: ["No scoring deductions: applicable obligations have current accepted evidence."],
-    summary: { totalApplicableObligations: 1, missingEvidenceCount: 0, criticalGapsCount: 0, demoRulesCount: 1, expertReviewedRulesCount: 0 },
+    rulesPackId: generated.rulesPack.rulesPackId,
+    country: generated.country,
+    region: generated.region,
+    readinessScore: generated.readinessScore,
+    scoreExplanation: generated.scoreExplanation,
+    summary: generated.summary,
     generatedByUserId: user.id,
-    gapRows: [{ id: "row", organizationId: org.id, facilityId: facility.id, ruleId: "us-loto-procedures", status: "accepted", priority: "critical" }],
-    findings: [],
-    actionPlan: []
+    evidenceMatches: generated.evidenceMatches,
+    gapRows: generated.gapRows,
+    findings: generated.findings,
+    actionPlan: generated.actionPlan
+  });
+  const packet = await repo.createAuditPacket({
+    organizationId: org.id,
+    facilityId: facility.id,
+    reviewId: review.id,
+    title: "Industrial Audit Readiness Packet",
+    fileReference: "packet.pdf",
+    generatedByUserId: user.id,
+    country: facility.country,
+    region: facility.region,
+    rulesPackId: generated.rulesPack.rulesPackId,
+    status: "generated"
   });
 
   const restarted = await repoAt(file);
   assert.equal((await restarted.listFacilities(org.id))[0].id, facility.id);
   assert.equal((await restarted.listEvidence(org.id, facility.id))[0].id, evidence.id);
-  assert.equal((await restarted.getReview(org.id, review.id)).readinessScore, 80);
-  assert.equal((await restarted.getGapRows(org.id, review.id)).length, 1);
+  assert.equal((await restarted.getReview(org.id, review.id)).readinessScore, generated.readinessScore);
+  assert.equal((await restarted.getGapRows(org.id, review.id)).length, generated.gapRows.length);
+  assert.ok((await restarted.getActionItems(org.id, review.id)).length > 0);
+  assert.ok((await restarted.getEvidenceMatches(org.id, facility.id)).some((match) => match.evidenceId === evidence.id));
+  assert.equal((await restarted.listAuditPackets(org.id, facility.id))[0].id, packet.id);
 });
 
 test("repository blocks cross-organization access", async () => {

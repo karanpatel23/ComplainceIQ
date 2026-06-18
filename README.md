@@ -50,6 +50,7 @@ Optional:
 - `ENABLE_DEMO_DATA`
 - `ADMIN_EMAIL`
 - `ADMIN_PASSWORD`
+- `TEST_DATABASE_URL`
 - `OPENAI_API_KEY`
 - `OPENAI_MODEL`
 - SMTP variables
@@ -103,6 +104,7 @@ The initial migration creates:
 - `audit_logs`
 
 Customer-owned tables include `organization_id` and indexes for tenant-scoped access.
+Evidence matches are persisted when a backend review is generated, so the rule-to-evidence relationship survives API restarts along with gap rows, findings, action items, and packet metadata.
 
 ## Development Seed
 
@@ -134,6 +136,25 @@ npm --workspace @complianceiq/web run dev
 ```
 
 Open `http://localhost:5173`. The frontend expects the API at `http://localhost:4000` by default.
+
+## Running Tests
+
+The default suite is self-contained and uses the non-production file adapter:
+
+```bash
+npm test
+npm run typecheck
+npm run lint
+npm run build
+```
+
+To exercise the real Postgres repository adapter, provide a disposable test database URL:
+
+```bash
+TEST_DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/complianceiq_test npm test
+```
+
+The Postgres integration test applies `0001_initial.sql`, writes uniquely named tenant data, reinitializes the repository, and verifies persistence for facilities, evidence, reviews, evidence matches, and audit packets.
 
 ## API Summary
 
@@ -196,7 +217,9 @@ Expert review and logs:
 - Core routes require authentication.
 - Customer-owned repository methods are scoped by `organizationId`.
 - Cross-organization resource access returns `403`.
+- Expert review requests validate referenced facilities and reviews against the caller's organization.
 - Evidence and packet files are private file references and download through authenticated API routes.
+- Client-supplied private file references are ignored; only backend storage writes can attach files.
 - `SESSION_SECRET`, `DATABASE_URL`, and production CORS are validated at startup.
 
 ## Rules And Scoring
@@ -233,6 +256,7 @@ Production should replace this with a private object storage adapter such as S3,
 - Create the first admin user through an internal provisioning flow or explicit non-production seed
 - Verify `npm test`, `npm run typecheck`, `npm run lint`, and `npm run build`
 - Configure private object storage for uploads and generated PDFs
+- Run the optional `TEST_DATABASE_URL=... npm test` Postgres integration check against disposable infrastructure
 - Confirm CORS allows only trusted web origins
 - Confirm demo data is disabled
 

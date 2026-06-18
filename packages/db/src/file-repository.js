@@ -176,7 +176,7 @@ export class FileRepository {
   }
 
   async saveApplicableRules(organizationId, facilityId, rulesPackId, rules) {
-    this.data.facilityApplicableRules = this.data.facilityApplicableRules.filter((row) => row.facilityId !== facilityId);
+    this.data.facilityApplicableRules = this.data.facilityApplicableRules.filter((row) => row.organizationId !== organizationId || row.facilityId !== facilityId);
     for (const rule of rules) {
       this.data.facilityApplicableRules.push({
         id: this.createId(),
@@ -206,6 +206,17 @@ export class FileRepository {
       createdAt: nowIso()
     };
     this.data.reviews.push(review);
+    this.data.evidenceMatches = this.data.evidenceMatches.filter((row) => row.organizationId !== input.organizationId || row.facilityId !== input.facilityId);
+    this.data.evidenceMatches.push(...(input.evidenceMatches || []).map((match) => ({
+      id: this.createId(),
+      organizationId: input.organizationId,
+      facilityId: input.facilityId,
+      ruleId: match.ruleId,
+      evidenceId: match.evidenceId,
+      matchType: match.matchType,
+      confidence: match.confidence,
+      createdAt: nowIso()
+    })));
     this.data.gapRows.push(...input.gapRows.map((row) => ({ id: this.createId(), organizationId: input.organizationId, reviewId, facilityId: input.facilityId, ruleId: row.ruleId, rowData: row, status: row.status, priority: row.priority, createdAt: nowIso() })));
     this.data.findings.push(...input.findings.map((finding) => ({ ...finding, id: this.createId(), reviewId, createdAt: nowIso() })));
     this.data.actionItems.push(...input.actionPlan.map((item) => ({ id: this.createId(), organizationId: input.organizationId, reviewId, facilityId: input.facilityId, relatedObligationId: item.relatedObligationId, title: item.title, itemData: item, bucket: item.bucket, priority: item.priority, status: item.status, dueDate: item.dueDate, createdAt: nowIso(), updatedAt: nowIso() })));
@@ -231,6 +242,11 @@ export class FileRepository {
   async getActionItems(organizationId, reviewId) {
     await this.getReview(organizationId, reviewId);
     return this.data.actionItems.filter((row) => row.organizationId === organizationId && row.reviewId === reviewId).map((row) => row.itemData);
+  }
+
+  async getEvidenceMatches(organizationId, facilityId) {
+    await this.getFacility(organizationId, facilityId);
+    return this.data.evidenceMatches.filter((row) => row.organizationId === organizationId && row.facilityId === facilityId);
   }
 
   async getFindings(organizationId, reviewId) {

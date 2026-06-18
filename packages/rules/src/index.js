@@ -142,8 +142,7 @@ export function buildEvidenceMatches(rules, evidence, now = new Date()) {
   return matches;
 }
 
-export function buildGapMatrix(facility, rules, evidence, rulesPack, now = new Date()) {
-  const evidenceMatches = buildEvidenceMatches(rules, evidence, now);
+export function buildGapMatrix(facility, rules, evidence, rulesPack, now = new Date(), evidenceMatches = buildEvidenceMatches(rules, evidence, now)) {
   return rules.map((ruleItem) => {
     const relatedMatches = evidenceMatches.filter((match) => match.ruleId === ruleItem.id);
     const matchedEvidence = relatedMatches
@@ -294,7 +293,8 @@ export function generateReview({ facility, evidence, now = new Date() }) {
   if (!rulesPack) {
     throw new Error(`No rules pack available for country ${facility.country}`);
   }
-  const gapRows = buildGapMatrix(facility, rules, evidence, rulesPack, now);
+  const evidenceMatches = buildEvidenceMatches(rules, evidence, now);
+  const gapRows = buildGapMatrix(facility, rules, evidence, rulesPack, now, evidenceMatches);
   const score = computeReadinessScore(gapRows);
   const actionPlan = generateActionPlan(gapRows);
   const acceptedEvidenceCount = evidence.filter((item) => item.status === "accepted" && !isExpired(item, now)).length;
@@ -308,6 +308,7 @@ export function generateReview({ facility, evidence, now = new Date() }) {
     region: facility.region,
     rulesPack,
     applicableRules: rules,
+    evidenceMatches,
     gapRows,
     actionPlan,
     findings: gapRows

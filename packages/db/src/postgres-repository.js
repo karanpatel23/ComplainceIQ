@@ -24,6 +24,13 @@ export class PostgresRepository {
     return result.rows;
   }
 
+  async close() {
+    if (this.pool) {
+      await this.pool.end();
+      this.pool = null;
+    }
+  }
+
   async seedRules() {
     for (const pack of RULES_PACKS) {
       await this.query(
@@ -222,6 +229,15 @@ export class PostgresRepository {
           [this.createId(), input.organizationId, reviewId, input.facilityId, finding.ruleId, finding.severity, finding.title, finding.description, finding.authority, finding.citation]
         );
       }
+      await client.query("DELETE FROM evidence_matches WHERE organization_id=$1 AND facility_id=$2", [input.organizationId, input.facilityId]);
+      for (const match of input.evidenceMatches || []) {
+        await client.query(
+          `INSERT INTO evidence_matches (id, organization_id, facility_id, rule_id, evidence_id, match_type, confidence)
+           VALUES ($1,$2,$3,$4,$5,$6,$7)
+           ON CONFLICT (rule_id, evidence_id) DO UPDATE SET match_type=EXCLUDED.match_type, confidence=EXCLUDED.confidence`,
+          [this.createId(), input.organizationId, input.facilityId, match.ruleId, match.evidenceId, match.matchType, match.confidence]
+        );
+      }
       for (const item of input.actionPlan) {
         await client.query(
           "INSERT INTO action_items (id, organization_id, review_id, facility_id, related_obligation_id, title, item_data, bucket, priority, status, due_date) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
@@ -260,6 +276,11 @@ export class PostgresRepository {
   async getActionItems(organizationId, reviewId) {
     await this.getReview(organizationId, reviewId);
     return (await this.query("SELECT item_data FROM action_items WHERE organization_id=$1 AND review_id=$2 ORDER BY due_date", [organizationId, reviewId])).map((row) => row.item_data);
+  }
+
+  async getEvidenceMatches(organizationId, facilityId) {
+    await this.getFacility(organizationId, facilityId);
+    return (await this.query("SELECT * FROM evidence_matches WHERE organization_id=$1 AND facility_id=$2 ORDER BY created_at", [organizationId, facilityId])).map(camelEvidenceMatch);
   }
 
   async getFindings(organizationId, reviewId) {
@@ -374,6 +395,10 @@ function camelReview(row) {
 
 function camelPacket(row) {
   return { id: row.id, organizationId: row.organization_id, facilityId: row.facility_id, reviewId: row.review_id, title: row.title, fileReference: row.file_reference, generatedByUserId: row.generated_by_user_id, generatedAt: row.generated_at, country: row.country, region: row.region, rulesPackId: row.rules_pack_id, status: row.status };
+}
+
+function camelEvidenceMatch(row) {
+  return { id: row.id, organizationId: row.organization_id, facilityId: row.facility_id, ruleId: row.rule_id, evidenceId: row.evidence_id, matchType: row.match_type, confidence: row.confidence, createdAt: row.created_at };
 }
 
 function camelExpertReview(row) {

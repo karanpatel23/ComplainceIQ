@@ -1,0 +1,10 @@
+{
+  "name": "@complianceiq/web",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node src/static-server.js",
+    "build": "node src/build.js"
+  }
+}

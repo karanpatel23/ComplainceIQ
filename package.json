@@ -1,0 +1,27 @@
+{
+  "name": "complianceiq",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "ComplianceIQ industrial audit-readiness platform for manufacturers.",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "node apps/api/src/server.js",
+    "start": "node apps/api/src/server.js",
+    "build": "npm run typecheck && npm run lint && npm --workspaces --if-present run build",
+    "typecheck": "node scripts/check-js.mjs",
+    "lint": "node scripts/lint.mjs",
+    "test": "node --test tests/*.test.js",
+    "db:migrate": "node packages/db/src/migrate.js",
+    "seed:demo": "node packages/db/src/seed.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "optionalDependencies": {
+    "pg": "^8.16.0"
+  }
+}

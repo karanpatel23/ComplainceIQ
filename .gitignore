@@ -1,0 +1,15 @@
+.DS_Store
+node_modules/
+.env
+.env.local
+data/
+coverage/
+dist/
+*.log
+tmp/
+
+# Keep the Replit export as reference-only when present.
+.replit
+.local/
+attached_assets/
+artifacts/

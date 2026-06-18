@@ -1,0 +1,19 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root { color-scheme: light; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  background: #f7f4ee;
+  color: #16202b;
+  text-rendering: optimizeLegibility;
+}
+::selection { background: #b58345; color: #fff; }
+.engineering-grid {
+  background-image: linear-gradient(rgba(63,95,120,.08) 1px, transparent 1px), linear-gradient(90deg, rgba(63,95,120,.08) 1px, transparent 1px);
+  background-size: 38px 38px;
+}
+.metal-rule { background: linear-gradient(90deg, transparent, rgba(181,131,69,.6), transparent); }
+.text-balance { text-wrap: balance; }

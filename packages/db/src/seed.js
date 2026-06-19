@@ -1,7 +1,8 @@
 import { readConfig } from "../../config/src/index.js";
 import { createRepository } from "./repository.js";
 import { hashPassword } from "../../../apps/api/src/security.js";
-import { parseFacilityInput } from "../../shared/src/index.js";
+import { parseEvidenceInput, parseFacilityInput } from "../../shared/src/index.js";
+import { generateReview, getApplicableRules } from "../../rules/src/index.js";
 
 const config = readConfig(process.env);
 
@@ -34,9 +35,9 @@ if (!admin) {
   });
 }
 
-const existingFacilities = await repo.listFacilities(org.id);
-if (existingFacilities.length === 0) {
-  await repo.createFacility(parseFacilityInput({
+let [facility] = await repo.listFacilities(org.id);
+if (!facility) {
+  facility = await repo.createFacility(parseFacilityInput({
     name: "Demo Metal Components Plant",
     country: "US",
     stateProvince: "OH",
@@ -62,4 +63,43 @@ if (existingFacilities.length === 0) {
   }, org.id));
 }
 
+const applicable = getApplicableRules(facility);
+await repo.saveApplicableRules(org.id, facility.id, applicable.rulesPack.rulesPackId, applicable.rules);
+facility = await repo.getFacility(org.id, facility.id);
+
+let evidence = await repo.listEvidence(org.id, facility.id);
+if (evidence.length === 0) {
+  const demoEvidence = await repo.createEvidence(parseEvidenceInput({
+    facilityId: facility.id,
+    title: "Demo LOTO procedure log",
+    description: "Explicit development demo evidence. Replace before any real assessment.",
+    evidenceType: "loto_procedures",
+    status: "accepted",
+    confidence: "medium",
+    documentDate: "2026-01-15"
+  }, org.id, admin.id));
+  evidence = [demoEvidence];
+}
+
+const existingReviews = await repo.listReviews(org.id, facility.id);
+if (existingReviews.length === 0) {
+  const generated = generateReview({ facility, evidence });
+  await repo.createReview({
+    organizationId: org.id,
+    facilityId: facility.id,
+    rulesPackId: generated.rulesPack.rulesPackId,
+    country: generated.country,
+    region: generated.region,
+    readinessScore: generated.readinessScore,
+    scoreExplanation: generated.scoreExplanation,
+    summary: generated.summary,
+    generatedByUserId: admin.id,
+    evidenceMatches: generated.evidenceMatches,
+    gapRows: generated.gapRows,
+    findings: generated.findings,
+    actionPlan: generated.actionPlan
+  });
+}
+
 console.error(`Seed complete. Admin email: ${admin.email}`);
+await repo.close?.();

@@ -19,7 +19,7 @@ Starter rules are demo/unverified unless separately expert-reviewed. The system 
 - `apps/api` - Node HTTP API, authentication, tenant scoping, review generation, evidence and packet downloads
 - `apps/web` - focused Audit Packet Builder frontend
 - `packages/config` - environment validation
-- `packages/db` - Postgres migration and repository adapters
+- `packages/db` - tracked Postgres migrations plus production Postgres and development file repositories
 - `packages/rules` - jurisdiction-specific rules packs, applicability, gap matrix, scoring, action plan
 - `packages/pdf` - backend audit packet PDF generation
 - `packages/shared` - validation and shared domain helpers
@@ -35,7 +35,6 @@ Required for production:
 
 - `NODE_ENV=production`
 - `PORT`
-- `API_HOST`
 - `APP_URL`
 - `ALLOWED_ORIGINS` without `*`
 - `DATABASE_URL`
@@ -47,6 +46,7 @@ Required for production:
 
 Optional:
 
+- `API_HOST` (defaults to `0.0.0.0` in production)
 - `ENABLE_DEMO_DATA`
 - `ADMIN_EMAIL`
 - `ADMIN_PASSWORD`
@@ -59,11 +59,13 @@ OpenAI and SMTP are optional. The core audit packet workflow works without them.
 
 ## Local Setup
 
-This rebuild uses npm scripts and Node 20+.
+This rebuild uses npm scripts and Node 20+. Root scripts load `.env` when it exists.
 
 ```bash
 npm install
 cp .env.example .env
+# Edit .env to configure Postgres and replace every placeholder.
+npm run db:migrate
 npm run typecheck
 npm test
 ```
@@ -71,20 +73,20 @@ npm test
 For a quick development smoke test without Postgres:
 
 ```bash
-REPOSITORY_BACKEND=file NODE_ENV=development SESSION_SECRET=development-secret-change-me npm run dev
+REPOSITORY_BACKEND=file DATABASE_URL= NODE_ENV=development SESSION_SECRET=development-secret-change-me npm run dev
 ```
 
 The file repository is only for local development and tests. Production must use Postgres.
 
 ## Database Setup
 
-Provision Postgres, set `DATABASE_URL`, then run:
+Provision Postgres, set `DATABASE_URL`, then run the tracked migration runner:
 
 ```bash
 REPOSITORY_BACKEND=postgres npm run db:migrate
 ```
 
-The initial migration creates:
+`schema_migrations` records each migration and an advisory lock prevents concurrent deploys from applying the same migration. `0001_initial` creates:
 
 - `organizations`
 - `users`
@@ -106,6 +108,8 @@ The initial migration creates:
 Customer-owned tables include `organization_id` and indexes for tenant-scoped access.
 Evidence matches are persisted when a backend review is generated, so the rule-to-evidence relationship survives API restarts along with gap rows, findings, action items, and packet metadata.
 
+`0002_persistence_hardening` persists `selected_rules_pack_id` on facilities, adds integrity constraints, and adds composite and foreign-key indexes for tenant-scoped access patterns. The API uses a bounded Postgres connection pool with connection, idle, and statement timeouts.
+
 ## Development Seed
 
 Demo seed is explicit and disabled by default.
@@ -120,6 +124,7 @@ npm run seed:demo
 ```
 
 Production refuses to run demo seed.
+The explicit development seed creates one clearly labeled demo organization, hashed-password administrator, facility, evidence record, and deterministic review. It is idempotent for that organization and never runs automatically.
 
 ## Initial Production Administrator
 
@@ -173,7 +178,7 @@ To exercise the real Postgres repository adapter, provide a disposable test data
 TEST_DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/complianceiq_test npm test
 ```
 
-The Postgres integration test applies `0001_initial.sql`, writes uniquely named tenant data, reinitializes the repository, and verifies persistence for facilities, evidence, reviews, evidence matches, and audit packets.
+The Postgres integration test applies all tracked migrations, writes uniquely named tenant data, reinitializes the repository, and verifies facilities, selected rules-pack context, evidence, score explanations, gap rows, action items, evidence matches, packets, and audit logs. It is skipped unless `TEST_DATABASE_URL` points to a disposable real Postgres database.
 
 ## API Summary
 
@@ -195,6 +200,7 @@ Facilities:
 Rules:
 
 - `GET /api/rules-packs`
+- `GET /api/rules-packs/:id`
 - `GET /api/rules`
 
 Evidence:
@@ -233,12 +239,16 @@ Expert review and logs:
 
 - Passwords are hashed with Node `scrypt`.
 - Sessions are persisted in the repository and signed with `SESSION_SECRET`.
+- Session records are tenant-checked and survive API restart.
 - Core routes require authentication.
 - Customer-owned repository methods are scoped by `organizationId`.
 - Cross-organization resource access returns `403`.
+- Unsafe browser requests with an untrusted `Origin` are rejected.
+- JSON and upload bodies are size-limited before full buffering.
 - Expert review requests validate referenced facilities and reviews against the caller's organization.
 - Evidence and packet files are private file references and download through authenticated API routes.
 - Client-supplied private file references are ignored; only backend storage writes can attach files.
+- The frontend escapes persisted content before rendering and restores the current session and latest persisted review after reload.
 - `SESSION_SECRET`, `DATABASE_URL`, and production CORS are validated at startup.
 
 ## Rules And Scoring
@@ -260,16 +270,16 @@ The result is clamped between 0 and 100, and the score explanation is persisted 
 
 ## Storage
 
-Local private storage is implemented for development:
+Storage is selected through a private-storage adapter factory. The implemented local adapter uses randomized references, traversal protection, restrictive filesystem permissions, size limits, and authenticated API downloads:
 
 - `UPLOAD_STORAGE_BACKEND=local`
 - `UPLOAD_DIR=data/private-storage`
 
-Production should replace this with a private object storage adapter such as S3, R2, or a private Supabase bucket. Public raw evidence URLs should not be exposed.
+Production should replace this with a durable private object storage adapter such as S3, R2, or a private Supabase bucket. Public raw evidence URLs should not be exposed. A deployment using ephemeral local disk is **not production-ready** because evidence and generated packet files can disappear even though their Postgres metadata persists.
 
 ## Deployment Checklist
 
-- Run `npm install`
+- Run `npm ci`
 - Set production environment variables
 - Run `npm run db:migrate`
 - Provision the first administrator with `npm run admin:provision`, then remove its `PROVISION_*` secrets
@@ -278,18 +288,29 @@ Production should replace this with a private object storage adapter such as S3,
 - Run the optional `TEST_DATABASE_URL=... npm test` Postgres integration check against disposable infrastructure
 - Confirm CORS allows only trusted web origins
 - Confirm demo data is disabled
+- Verify `/api/health` reports the Postgres backend as healthy
+- Verify the selected private object-storage adapter is durable and non-public
 
 ## Known Limitations
 
 - Starter rules are demo/unverified unless expert-reviewed.
 - AI parsing is intentionally not included yet.
 - Local private storage is not a production object-storage solution.
+- A real Postgres integration run still requires a disposable `TEST_DATABASE_URL`; the self-contained suite deliberately does not emulate Postgres.
+- Login rate limiting and account recovery are not implemented yet.
 - The static frontend is focused on the core workflow; future work can replace it with a richer React/Next app without moving compliance logic to the client.
 - Province/state-specific Canadian and Mexican rule depth needs expert legal/EHS review before commercial reliance.
 
+## Deployment Readiness Status
+
+The application code, authenticated routes, deterministic backend logic, file-adapter restart tests, environment validation, and builds are passing. Do **not** call a deployment production-ready until both of these environment-dependent gates pass:
+
+1. Run the integration suite against a disposable real Postgres instance via `TEST_DATABASE_URL`.
+2. Configure a durable private object-storage adapter; the implemented local adapter is development-only for deployments with ephemeral disks.
+
 ## Next Recommended Sprint
 
-1. Add a production object-storage adapter.
-2. Add deeper integration tests against a disposable Postgres database.
-3. Expand review workflows for expert-reviewed rules without broadening the product.
-4. Improve the web app with a design-system frontend while keeping backend source-of-truth rules and scoring.
+1. Add a durable production object-storage adapter and integration tests for upload, re-download, and deletion failure handling.
+2. Run the Postgres suite in CI against an ephemeral real Postgres service and gate deployments on it.
+3. Add distributed login rate limiting and a production account-recovery flow.
+4. Expand expert-review workflow depth without broadening the product or rules coverage.

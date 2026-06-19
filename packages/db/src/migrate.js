@@ -1,20 +1,19 @@
-import { readConfig } from "../../config/src/index.js";
-import { loadInitialMigrationSql } from "./repository.js";
+import { readRepositoryConfig } from "../../config/src/index.js";
+import { runMigrations } from "./migration-runner.js";
+import { createPostgresPool } from "./postgres-pool.js";
+import { loadMigrations } from "./repository.js";
 
-const config = readConfig(process.env);
+const config = readRepositoryConfig(process.env);
 
 if (config.repositoryBackend !== "postgres") {
   throw new Error("db:migrate requires REPOSITORY_BACKEND=postgres and DATABASE_URL");
 }
 
-const pg = await import("pg");
-const Pool = pg.default?.Pool || pg.Pool;
-const pool = new Pool({ connectionString: config.databaseUrl });
+const pool = await createPostgresPool(config.databaseUrl);
 
 try {
-  const sql = await loadInitialMigrationSql();
-  await pool.query(sql);
-  console.error("Migration 0001_initial.sql applied.");
+  const applied = await runMigrations(pool, await loadMigrations());
+  console.error(applied.length ? `Applied migrations: ${applied.join(", ")}` : "Database migrations are up to date.");
 } finally {
   await pool.end();
 }

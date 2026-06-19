@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readConfig } from "../packages/config/src/index.js";
+import { readConfig, readRepositoryConfig } from "../packages/config/src/index.js";
 
 const productionEnv = {
   NODE_ENV: "production",
@@ -23,6 +23,12 @@ test("production config fails fast when core env vars are missing", () => {
 test("production config rejects wildcard CORS and weak session secrets", () => {
   assert.throws(() => readConfig({ ...productionEnv, ALLOWED_ORIGINS: "*" }), /ALLOWED_ORIGINS/);
   assert.throws(() => readConfig({ ...productionEnv, SESSION_SECRET: "short" }), /SESSION_SECRET/);
+  assert.throws(() => readConfig({ ...productionEnv, ENABLE_DEMO_DATA: "true" }), /ENABLE_DEMO_DATA/);
+});
+
+test("production config rejects invalid ports and origins", () => {
+  assert.throws(() => readConfig({ ...productionEnv, PORT: "70000" }), /PORT/);
+  assert.throws(() => readConfig({ ...productionEnv, ALLOWED_ORIGINS: "not-a-url" }), /valid absolute URLs/);
 });
 
 test("production config accepts optional integrations as absent", () => {
@@ -30,4 +36,11 @@ test("production config accepts optional integrations as absent", () => {
   assert.equal(config.repositoryBackend, "postgres");
   assert.equal(config.databaseUrl, productionEnv.DATABASE_URL);
   assert.equal(config.enableDemoData, false);
+});
+
+test("repository config requires Postgres in production without requiring unrelated runtime settings", () => {
+  assert.throws(() => readRepositoryConfig({ NODE_ENV: "production", REPOSITORY_BACKEND: "file" }), /must be postgres/);
+  const config = readRepositoryConfig({ NODE_ENV: "production", REPOSITORY_BACKEND: "postgres", DATABASE_URL: productionEnv.DATABASE_URL });
+  assert.equal(config.repositoryBackend, "postgres");
+  assert.equal(config.databaseUrl, productionEnv.DATABASE_URL);
 });

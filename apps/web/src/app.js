@@ -90,12 +90,12 @@ function appView() {
             <p class="eyebrow">Audit Packet Builder</p>
             <h1>Build an Industrial Audit Readiness Packet</h1>
           </div>
-          <div class="user-pill">${state.user.email}</div>
+          <div class="user-pill">${html(state.user.email)}</div>
         </header>
         ${errorHtml()}
         <section class="summary-grid">
-          <div class="metric"><span>Selected facility</span><strong>${facility ? facility.name : "None"}</strong></div>
-          <div class="metric"><span>Jurisdiction</span><strong>${facility ? `${facility.country} / ${facility.region}` : "Select facility"}</strong></div>
+          <div class="metric"><span>Selected facility</span><strong>${facility ? html(facility.name) : "None"}</strong></div>
+          <div class="metric"><span>Jurisdiction</span><strong>${facility ? `${html(facility.country)} / ${html(facility.region)}` : "Select facility"}</strong></div>
           <div class="metric"><span>Readiness score</span><strong>${state.latestReview ? `${state.latestReview.readinessScore}/100` : "Not generated"}</strong></div>
           <div class="metric critical"><span>Critical gaps</span><strong>${state.latestReview?.summary?.criticalGapsCount ?? 0}</strong></div>
         </section>
@@ -106,7 +106,7 @@ function appView() {
         <section class="builder-band">
           <div>
             <h2>Jurisdiction-specific rules pack</h2>
-            <p>${facility ? "Rules are selected by backend using country, region, industry, facility type, employee count, and hazard profile." : "Create or select a facility to view rules pack context."}</p>
+            <p>${facility ? `Backend-selected pack: ${html(facility.selectedRulesPackId || "selection pending")}. Rules use country, region, industry, facility type, employee count, and hazard profile.` : "Create or select a facility to view rules pack context."}</p>
           </div>
           <button id="generate-review" ${facility ? "" : "disabled"}>Generate Gap Matrix</button>
         </section>
@@ -120,7 +120,7 @@ function appView() {
 }
 
 function facilityPanel() {
-  const options = state.facilities.map((facility) => `<option value="${facility.id}" ${facility.id === state.selectedFacilityId ? "selected" : ""}>${facility.name} (${facility.country}/${facility.region})</option>`).join("");
+  const options = state.facilities.map((facility) => `<option value="${html(facility.id)}" ${facility.id === state.selectedFacilityId ? "selected" : ""}>${html(facility.name)} (${html(facility.country)}/${html(facility.region)})</option>`).join("");
   return `
     <section class="panel">
       <h2>Facility Setup</h2>
@@ -182,7 +182,7 @@ function evidencePanel() {
         <button type="submit" ${facility ? "" : "disabled"}>Log Evidence</button>
       </form>
       <div class="mini-list">
-        ${state.evidence.length ? state.evidence.map((item) => `<div><strong>${item.title}</strong><span>${item.evidenceType} · ${item.status}</span></div>`).join("") : "<p>No evidence logged for this facility.</p>"}
+        ${state.evidence.length ? state.evidence.map((item) => `<div><strong>${html(item.title)}</strong><span>${html(item.evidenceType)} · ${html(item.status)}</span></div>`).join("") : "<p>No evidence logged for this facility.</p>"}
       </div>
     </section>
   `;
@@ -195,7 +195,7 @@ function scorePanel() {
       <h2>Readiness Score Explanation</h2>
       <div class="score-row">
         <strong>${state.latestReview.readinessScore}/100</strong>
-        <ul>${state.latestReview.scoreExplanation.map((line) => `<li>${line}</li>`).join("")}</ul>
+        <ul>${state.latestReview.scoreExplanation.map((line) => `<li>${html(line)}</li>`).join("")}</ul>
       </div>
     </section>
   `;
@@ -210,14 +210,14 @@ function gapMatrix() {
           <thead><tr><th>Priority</th><th>Status</th><th>Jurisdiction</th><th>Authority</th><th>Citation</th><th>Obligation</th><th>Required Evidence</th><th>Demo</th></tr></thead>
           <tbody>
             ${state.gapRows.length ? state.gapRows.map((row) => `
-              <tr class="${row.priority}">
-                <td>${row.priority}</td>
-                <td><span class="status ${row.status}">${row.status}</span></td>
-                <td>${row.country}/${row.region}</td>
-                <td>${row.authority}</td>
-                <td>${row.citation}</td>
-                <td>${row.obligationTitle}</td>
-                <td>${row.requiredEvidence.join(", ")}</td>
+              <tr class="${html(row.priority)}">
+                <td>${html(row.priority)}</td>
+                <td><span class="status ${html(row.status)}">${html(row.status)}</span></td>
+                <td>${html(row.country)}/${html(row.region)}</td>
+                <td>${html(row.authority)}</td>
+                <td>${html(row.citation)}</td>
+                <td>${html(row.obligationTitle)}</td>
+                <td>${row.requiredEvidence.map(html).join(", ")}</td>
                 <td>${row.demoContent ? "Unverified" : "Reviewed"}</td>
               </tr>
             `).join("") : `<tr><td colspan="8">Generate a backend review to populate the matrix.</td></tr>`}
@@ -237,7 +237,7 @@ function actionPlan() {
         ${groups.map((bucket) => `
           <div>
             <h3>${bucket.replace("_", " / ").replace("_", " ")}</h3>
-            ${(state.actionItems.filter((item) => item.bucket === bucket).map((item) => `<article><strong>${item.title}</strong><span>${item.ownerRole} · ${item.dueDate}</span><p>${item.recommendedNextStep}</p></article>`).join("")) || "<p>No actions in this bucket.</p>"}
+            ${(state.actionItems.filter((item) => item.bucket === bucket).map((item) => `<article><strong>${html(item.title)}</strong><span>${html(item.ownerRole)} · ${html(item.dueDate)}</span><p>${html(item.recommendedNextStep)}</p></article>`).join("")) || "<p>No actions in this bucket.</p>"}
           </div>
         `).join("")}
       </div>
@@ -256,7 +256,7 @@ function packetPanel() {
     </section>
     <section class="panel">
       <h2>Generated Packets</h2>
-      <div class="mini-list">${state.packets.length ? state.packets.map((packet) => `<div><strong>${packet.title}</strong><span>${packet.generatedAt}</span><a href="${API_BASE}/api/audit-packets/${packet.id}/download" target="_blank">Download</a></div>`).join("") : "<p>No packets exported yet.</p>"}</div>
+      <div class="mini-list">${state.packets.length ? state.packets.map((packet) => `<div><strong>${html(packet.title)}</strong><span>${html(packet.generatedAt)}</span><button class="secondary" data-packet-download="${html(packet.id)}">Download</button></div>`).join("") : "<p>No packets exported yet.</p>"}</div>
     </section>
   `;
 }
@@ -266,7 +266,7 @@ function hazardCheckbox(name, label) {
 }
 
 function errorHtml() {
-  return state.error ? `<div class="error">${state.error}</div>` : "";
+  return state.error ? `<div class="error">${html(state.error)}</div>` : "";
 }
 
 function currentFacility() {
@@ -285,6 +285,7 @@ function bindEvents() {
   document.querySelector("#evidence-form")?.addEventListener("submit", onCreateEvidence);
   document.querySelector("#generate-review")?.addEventListener("click", onGenerateReview);
   document.querySelector("#export-packet")?.addEventListener("click", onExportPacket);
+  document.querySelectorAll("[data-packet-download]").forEach((button) => button.addEventListener("click", () => onDownloadPacket(button.dataset.packetDownload)));
 }
 
 async function onLogin(event) {
@@ -298,9 +299,11 @@ async function onLogin(event) {
 }
 
 async function onLogout() {
-  await api("/api/auth/logout", { method: "POST", body: {} });
-  state.user = null;
-  render();
+  await run(async () => {
+    await api("/api/auth/logout", { method: "POST", body: {} });
+    Object.assign(state, { user: null, organization: null, facilities: [], selectedFacilityId: null, evidence: [], latestReview: null, gapRows: [], actionItems: [], packets: [] });
+    render();
+  });
 }
 
 async function bootstrap() {
@@ -315,11 +318,31 @@ async function refreshFacilityData() {
   if (!facility) {
     state.evidence = [];
     state.packets = [];
+    state.latestReview = null;
+    state.gapRows = [];
+    state.actionItems = [];
     render();
     return;
   }
-  state.evidence = await api(`/api/evidence?facilityId=${facility.id}`);
-  state.packets = await api(`/api/audit-packets?facilityId=${facility.id}`);
+  const facilityId = encodeURIComponent(facility.id);
+  const [evidence, packets, reviews] = await Promise.all([
+    api(`/api/evidence?facilityId=${facilityId}`),
+    api(`/api/audit-packets?facilityId=${facilityId}`),
+    api(`/api/audit-readiness/reviews?facilityId=${facilityId}`)
+  ]);
+  state.evidence = evidence;
+  state.packets = packets;
+  state.latestReview = reviews[0] || null;
+  if (state.latestReview) {
+    const reviewId = encodeURIComponent(state.latestReview.id);
+    [state.gapRows, state.actionItems] = await Promise.all([
+      api(`/api/audit-readiness/reviews/${reviewId}/gap-matrix`),
+      api(`/api/audit-readiness/reviews/${reviewId}/action-plan`)
+    ]);
+  } else {
+    state.gapRows = [];
+    state.actionItems = [];
+  }
   render();
 }
 
@@ -375,6 +398,22 @@ async function onExportPacket() {
   });
 }
 
+async function onDownloadPacket(packetId) {
+  await run(async () => {
+    const response = await fetch(`${API_BASE}/api/audit-packets/${encodeURIComponent(packetId)}/download`, { credentials: "include" });
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      throw new Error(data.error || `Packet download failed: ${response.status}`);
+    }
+    const url = URL.createObjectURL(await response.blob());
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `industrial-audit-readiness-packet-${packetId}.pdf`;
+    link.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+  });
+}
+
 async function run(work) {
   state.error = "";
   try {
@@ -393,8 +432,32 @@ async function api(path, options = {}) {
     body: options.body ? JSON.stringify(options.body) : undefined
   });
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.error || `API request failed: ${response.status}`);
+  if (!response.ok) {
+    const error = new Error(data.error || `API request failed: ${response.status}`);
+    error.status = response.status;
+    throw error;
+  }
   return data;
 }
 
-render();
+function html(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+async function initialize() {
+  try {
+    state.user = await api("/api/auth/me");
+    await bootstrap();
+  } catch (error) {
+    state.user = null;
+    if (error.status !== 401) state.error = error.message;
+    render();
+  }
+}
+
+initialize();

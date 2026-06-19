@@ -3,6 +3,10 @@ export function readRepositoryConfig(env = process.env) {
   const isProduction = nodeEnv === "production";
   const repositoryBackend = env.REPOSITORY_BACKEND || (env.DATABASE_URL ? "postgres" : "file");
 
+  if (!["postgres", "file"].includes(repositoryBackend)) {
+    throw new Error("REPOSITORY_BACKEND must be postgres or file");
+  }
+
   if (repositoryBackend === "postgres" && !env.DATABASE_URL) {
     throw new Error("DATABASE_URL is required when REPOSITORY_BACKEND=postgres");
   }
@@ -27,15 +31,30 @@ export function readConfig(env = process.env) {
     .map((origin) => origin.trim())
     .filter(Boolean);
 
-  if (isProduction && allowedOrigins.includes("*")) {
-    throw new Error("ALLOWED_ORIGINS must not include * in production");
-  }
-
   if (isProduction) {
     const required = ["PORT", "APP_URL", "ALLOWED_ORIGINS", "DATABASE_URL", "SESSION_SECRET", "UPLOAD_STORAGE_BACKEND", "UPLOAD_DIR", "MAX_UPLOAD_MB"];
     const missing = required.filter((name) => !env[name]);
     if (missing.length > 0) {
       throw new Error(`Missing required production environment variables: ${missing.join(", ")}`);
+    }
+  }
+
+  const port = Number.parseInt(env.PORT || "4000", 10);
+
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+    throw new Error("PORT must be an integer between 1 and 65535");
+  }
+
+  if (isProduction && allowedOrigins.includes("*")) {
+    throw new Error("ALLOWED_ORIGINS must not include * in production");
+  }
+
+  if (isProduction) {
+    try {
+      new URL(env.APP_URL);
+      for (const origin of allowedOrigins) new URL(origin);
+    } catch {
+      throw new Error("APP_URL and ALLOWED_ORIGINS must contain valid absolute URLs in production");
     }
   }
 
@@ -55,7 +74,7 @@ export function readConfig(env = process.env) {
   return {
     nodeEnv,
     isProduction,
-    port: Number.parseInt(env.PORT || "4000", 10),
+    port,
     apiHost: env.API_HOST || (isProduction ? "0.0.0.0" : "127.0.0.1"),
     appUrl: env.APP_URL || "http://localhost:5173",
     allowedOrigins,

@@ -16,6 +16,7 @@
     "lint": "node scripts/lint.mjs",
     "test": "node --test tests/*.test.js",
     "db:migrate": "node packages/db/src/migrate.js",
+    "admin:provision": "node packages/db/src/provision-admin.js",
     "seed:demo": "node packages/db/src/seed.js"
   },
   "engines": {

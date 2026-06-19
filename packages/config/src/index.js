@@ -1,7 +1,27 @@
-export function readConfig(env = process.env) {
+export function readRepositoryConfig(env = process.env) {
   const nodeEnv = env.NODE_ENV || "development";
   const isProduction = nodeEnv === "production";
   const repositoryBackend = env.REPOSITORY_BACKEND || (env.DATABASE_URL ? "postgres" : "file");
+
+  if (repositoryBackend === "postgres" && !env.DATABASE_URL) {
+    throw new Error("DATABASE_URL is required when REPOSITORY_BACKEND=postgres");
+  }
+
+  if (isProduction && repositoryBackend !== "postgres") {
+    throw new Error("REPOSITORY_BACKEND must be postgres in production");
+  }
+
+  return {
+    nodeEnv,
+    isProduction,
+    repositoryBackend,
+    databaseUrl: env.DATABASE_URL || ""
+  };
+}
+
+export function readConfig(env = process.env) {
+  const repositoryConfig = readRepositoryConfig(env);
+  const { nodeEnv, isProduction, repositoryBackend } = repositoryConfig;
   const allowedOrigins = (env.ALLOWED_ORIGINS || "http://localhost:5173,http://localhost:4000")
     .split(",")
     .map((origin) => origin.trim())
@@ -17,14 +37,6 @@ export function readConfig(env = process.env) {
     if (missing.length > 0) {
       throw new Error(`Missing required production environment variables: ${missing.join(", ")}`);
     }
-  }
-
-  if (repositoryBackend === "postgres" && !env.DATABASE_URL) {
-    throw new Error("DATABASE_URL is required when REPOSITORY_BACKEND=postgres");
-  }
-
-  if (isProduction && !env.DATABASE_URL) {
-    throw new Error("DATABASE_URL is required in production");
   }
 
   if (isProduction && (!env.SESSION_SECRET || env.SESSION_SECRET.length < 32)) {
@@ -47,7 +59,7 @@ export function readConfig(env = process.env) {
     apiHost: env.API_HOST || (isProduction ? "0.0.0.0" : "127.0.0.1"),
     appUrl: env.APP_URL || "http://localhost:5173",
     allowedOrigins,
-    databaseUrl: env.DATABASE_URL || "",
+    databaseUrl: repositoryConfig.databaseUrl,
     repositoryBackend,
     sessionSecret: env.SESSION_SECRET || "development-only-session-secret-change-me",
     uploadStorageBackend: env.UPLOAD_STORAGE_BACKEND || "local",

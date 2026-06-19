@@ -14,6 +14,7 @@ const TABLES = [
   "facilities",
   "facilityApplicableRules",
   "evidence",
+  "evidenceAiAnalyses",
   "evidenceMatches",
   "reviews",
   "gapRows",
@@ -34,6 +35,9 @@ export class FileRepository {
     await mkdir(path.dirname(this.filePath), { recursive: true });
     try {
       this.data = JSON.parse(await readFile(this.filePath, "utf8"));
+      for (const table of TABLES) {
+        if (!Array.isArray(this.data[table])) this.data[table] = [];
+      }
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
       this.data = Object.fromEntries(TABLES.map((table) => [table, []]));
@@ -177,6 +181,55 @@ export class FileRepository {
 
   async archiveEvidence(organizationId, id) {
     return this.updateEvidence(organizationId, id, { archived: true });
+  }
+
+  async upsertAiAnalysis(input) {
+    const evidence = await this.getEvidence(input.organizationId, input.evidenceId);
+    if (evidence.facilityId !== input.facilityId) throw forbidden("AI analysis facility does not match the evidence facility");
+    const existing = this.data.evidenceAiAnalyses.find((row) => row.evidenceId === input.evidenceId);
+    if (existing && existing.organizationId !== input.organizationId) throw forbidden("AI analysis belongs to another organization");
+    if (existing) {
+      Object.assign(existing, input, { id: existing.id, createdAt: existing.createdAt, updatedAt: nowIso() });
+      await this.persist();
+      return existing;
+    }
+    const row = { id: input.id || this.createId(), createdAt: nowIso(), updatedAt: nowIso(), ...input };
+    this.data.evidenceAiAnalyses.push(row);
+    await this.persist();
+    return row;
+  }
+
+  async getAiAnalysis(organizationId, evidenceId) {
+    await this.getEvidence(organizationId, evidenceId);
+    return this.data.evidenceAiAnalyses.find((row) => row.organizationId === organizationId && row.evidenceId === evidenceId) || null;
+  }
+
+  async listAiAnalyses(organizationId, facilityId) {
+    await this.getFacility(organizationId, facilityId);
+    return this.data.evidenceAiAnalyses
+      .filter((row) => row.organizationId === organizationId && row.facilityId === facilityId)
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  async applyAiHumanReview(input) {
+    const evidence = await this.getEvidence(input.organizationId, input.evidenceId);
+    const analysis = await this.getAiAnalysis(input.organizationId, input.evidenceId);
+    if (!analysis) return null;
+    Object.assign(evidence, input.evidenceUpdates, { updatedAt: nowIso() });
+    Object.assign(analysis, input.analysisUpdates, { updatedAt: nowIso() });
+    this.data.auditLogs.push({
+      id: this.createId(),
+      organizationId: input.organizationId,
+      facilityId: evidence.facilityId,
+      actorUserId: input.reviewerId,
+      action: input.auditAction,
+      entityType: "evidence_ai_analysis",
+      entityId: analysis.id,
+      metadata: input.auditMetadata || {},
+      createdAt: nowIso()
+    });
+    await this.persist();
+    return { evidence, analysis };
   }
 
   async listRulesPacks() {

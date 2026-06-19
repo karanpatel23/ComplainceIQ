@@ -2,15 +2,19 @@ import http from "node:http";
 import { URL } from "node:url";
 import { readConfig } from "../../../packages/config/src/index.js";
 import { createRepository } from "../../../packages/db/src/repository.js";
-import { forbidden, parseEvidenceInput, parseFacilityInput, toPublicUser, jsonError, unauthorized, validationError } from "../../../packages/shared/src/index.js";
+import { createEvidenceAiProvider, parseAiReviewInput } from "../../../packages/ai/src/index.js";
+import { EVIDENCE_TAXONOMY, forbidden, parseEvidenceInput, parseFacilityInput, toPublicUser, jsonError, unauthorized, validationError } from "../../../packages/shared/src/index.js";
 import { getApplicableRules, generateReview, RULES_PACKS, COMPLIANCE_RULES } from "../../../packages/rules/src/index.js";
 import { generateAuditPacketPdf } from "../../../packages/pdf/src/index.js";
 import { createPrivateStorage } from "./storage.js";
 import { signSessionId, verifyPassword, verifySignedSession } from "./security.js";
+import { createEvidenceAiService } from "./evidence-ai-service.js";
 
 const config = readConfig(process.env);
 const repo = await createRepository(config);
 const storage = createPrivateStorage(config);
+const aiProvider = createEvidenceAiProvider(config);
+const evidenceAiService = createEvidenceAiService({ config, repo, storage, provider: aiProvider });
 const DEFAULT_JSON_LIMIT_BYTES = 1024 * 1024;
 const UPLOAD_JSON_LIMIT_BYTES = Math.ceil(config.maxUploadMb * 1024 * 1024 * 4 / 3) + 256 * 1024;
 
@@ -49,6 +53,8 @@ async function handleRequest(req, res) {
   const user = await requireSession(req);
 
   if (method === "GET" && path === "/api/auth/me") return sendJson(res, { status: 200, body: toPublicUser(user) });
+  if (method === "GET" && path === "/api/ai/status") return sendJson(res, { status: 200, body: { enabled: config.aiEnabled, provider: aiProvider.kind, model: aiProvider.model || null } });
+  if (method === "GET" && path === "/api/evidence-taxonomy") return sendJson(res, { status: 200, body: EVIDENCE_TAXONOMY });
   if (method === "GET" && path === "/api/organization") return currentOrganization(res, user);
   if (method === "GET" && path === "/api/users") return listUsers(res, user);
 
@@ -70,6 +76,10 @@ async function handleRequest(req, res) {
   if (match(path, "/api/evidence/:id") && method === "PATCH") return updateEvidence(req, res, user, params(path).id);
   if (match(path, "/api/evidence/:id") && method === "DELETE") return archiveEvidence(res, user, params(path).id);
   if (match(path, "/api/evidence/:id/download") && method === "GET") return downloadEvidence(res, user, params(path).id);
+  if (match(path, "/api/evidence/:id/process-ai") && method === "POST") return processEvidenceAi(res, user, params(path).id);
+  if (match(path, "/api/evidence/:id/ai-analysis") && method === "GET") return getEvidenceAiAnalysis(res, user, params(path).id);
+  if (match(path, "/api/evidence/:id/ai-review") && method === "PATCH") return reviewEvidenceAi(req, res, user, params(path).id);
+  if (path === "/api/evidence-ai-analyses" && method === "GET") return listEvidenceAiAnalyses(res, user, url.searchParams.get("facilityId"));
 
   if (path === "/api/audit-readiness/reviews" && method === "GET") return listReviews(res, user, url.searchParams.get("facilityId"));
   if (path === "/api/audit-readiness/reviews" && method === "POST") return createReview(req, res, user);
@@ -208,22 +218,51 @@ async function listEvidence(res, user, facilityId) {
 
 async function createEvidence(req, res, user, allowsFile) {
   const body = await readJson(req, allowsFile ? UPLOAD_JSON_LIMIT_BYTES : DEFAULT_JSON_LIMIT_BYTES);
+  if (["accepted", "rejected"].includes(body.status)) requireRole(user, ["admin", "reviewer"]);
   const facility = await requireFacility(user.organizationId, body.facilityId);
   let fileReference = null;
+  let fileMetadata = { fileName: null, contentType: null, fileSizeBytes: null, fileSha256: null };
   if (allowsFile) {
     if (!body.contentBase64) throw validationError("contentBase64 is required for evidence upload");
-    const saved = await storage.saveBuffer(decodeBase64(body.contentBase64), body.fileName || "evidence.bin");
+    const buffer = decodeBase64(body.contentBase64);
+    const fileName = safeOriginalFileName(body.fileName || "evidence.bin");
+    const saved = await storage.saveBuffer(buffer, fileName);
     fileReference = saved.fileReference;
+    fileMetadata = {
+      fileName,
+      contentType: normalizeContentType(body.contentType),
+      fileSizeBytes: buffer.byteLength,
+      fileSha256: saved.sha256
+    };
   }
   let evidence;
   try {
-    evidence = await repo.createEvidence(parseEvidenceInput({ ...body, fileReference, country: facility.country, region: facility.region }, user.organizationId, user.id));
+    evidence = await repo.createEvidence(parseEvidenceInput({
+      ...body,
+      fileReference,
+      ...fileMetadata,
+      country: facility.country,
+      region: facility.region
+    }, user.organizationId, user.id));
   } catch (error) {
     if (fileReference) await storage.deleteBuffer(fileReference);
     throw error;
   }
-  await audit(user, facility.id, "evidence.created", "evidence", evidence.id, { evidenceType: evidence.evidenceType });
-  sendJson(res, { status: 201, body: evidence });
+  await audit(user, facility.id, allowsFile ? "evidence_uploaded" : "evidence.created", "evidence", evidence.id, { evidenceType: evidence.evidenceType, hasFile: allowsFile });
+  let aiAnalysis = null;
+  let aiProcessingError = null;
+  let aiReview = null;
+  if (allowsFile) {
+    try {
+      aiAnalysis = await evidenceAiService.processEvidence({ organizationId: user.organizationId, evidenceId: evidence.id, userId: user.id });
+      evidence = await repo.getEvidence(user.organizationId, evidence.id);
+      aiReview = await generateAndPersistReview(user, facility);
+    } catch (error) {
+      aiAnalysis = await repo.getAiAnalysis(user.organizationId, evidence.id);
+      aiProcessingError = String(error.message || "AI evidence processing failed");
+    }
+  }
+  sendJson(res, { status: 201, body: { ...evidence, aiAnalysis, aiProcessingError, aiReview } });
 }
 
 async function getEvidence(res, user, id) {
@@ -234,7 +273,19 @@ async function getEvidence(res, user, id) {
 async function updateEvidence(req, res, user, id) {
   const existing = await requireEvidence(user.organizationId, id);
   const body = await readJson(req);
-  const updates = parseEvidenceInput({ ...existing, ...body, fileReference: existing.fileReference, facilityId: existing.facilityId, country: existing.country, region: existing.region }, user.organizationId, user.id);
+  if (["accepted", "rejected"].includes(body.status) && body.status !== existing.status) requireRole(user, ["admin", "reviewer"]);
+  const updates = parseEvidenceInput({
+    ...existing,
+    ...body,
+    fileReference: existing.fileReference,
+    fileName: existing.fileName,
+    contentType: existing.contentType,
+    fileSizeBytes: existing.fileSizeBytes,
+    fileSha256: existing.fileSha256,
+    facilityId: existing.facilityId,
+    country: existing.country,
+    region: existing.region
+  }, user.organizationId, user.id);
   const evidence = await repo.updateEvidence(user.organizationId, id, updates);
   await audit(user, evidence.facilityId, "evidence.updated", "evidence", evidence.id, { status: evidence.status });
   sendJson(res, { status: 200, body: evidence });
@@ -255,14 +306,20 @@ async function downloadEvidence(res, user, id) {
   }
   const buffer = await storage.readBuffer(evidence.fileReference);
   await audit(user, evidence.facilityId, "evidence.downloaded", "evidence", evidence.id, {});
-  sendBuffer(res, buffer, "application/octet-stream", `${safeDownloadName(evidence.title)}.bin`);
+  sendBuffer(res, buffer, evidence.contentType || "application/octet-stream", evidence.fileName || `${safeDownloadName(evidence.title)}.bin`);
 }
 
 async function createReview(req, res, user) {
   const body = await readJson(req);
   const facility = await requireFacility(user.organizationId, body.facilityId);
+  const generated = await generateAndPersistReview(user, facility);
+  sendJson(res, { status: 201, body: generated });
+}
+
+async function generateAndPersistReview(user, facility) {
   const evidence = await repo.listEvidence(user.organizationId, facility.id);
-  const generated = generateReview({ facility, evidence });
+  const aiAnalyses = await repo.listAiAnalyses(user.organizationId, facility.id);
+  const generated = generateReview({ facility, evidence, aiAnalyses });
   await repo.saveApplicableRules(user.organizationId, facility.id, generated.rulesPack.rulesPackId, generated.applicableRules);
   const review = await repo.createReview({
     organizationId: user.organizationId,
@@ -280,7 +337,46 @@ async function createReview(req, res, user) {
     actionPlan: generated.actionPlan
   });
   await audit(user, facility.id, "review.generated", "audit_readiness_review", review.id, { readinessScore: review.readinessScore });
-  sendJson(res, { status: 201, body: { review, gapRows: generated.gapRows, actionPlan: generated.actionPlan, rulesPack: generated.rulesPack } });
+  return { review, gapRows: generated.gapRows, actionPlan: generated.actionPlan, rulesPack: generated.rulesPack };
+}
+
+async function processEvidenceAi(res, user, evidenceId) {
+  await requireEvidence(user.organizationId, evidenceId);
+  const analysis = await evidenceAiService.processEvidence({ organizationId: user.organizationId, evidenceId, userId: user.id });
+  const facility = await requireFacility(user.organizationId, analysis.facilityId);
+  const generated = await generateAndPersistReview(user, facility);
+  sendJson(res, { status: 200, body: { analysis, ...generated } });
+}
+
+async function getEvidenceAiAnalysis(res, user, evidenceId) {
+  await requireEvidence(user.organizationId, evidenceId);
+  const analysis = await repo.getAiAnalysis(user.organizationId, evidenceId);
+  if (!analysis) {
+    const error = new Error("AI analysis not found");
+    error.status = 404;
+    throw error;
+  }
+  sendJson(res, { status: 200, body: analysis });
+}
+
+async function listEvidenceAiAnalyses(res, user, facilityId) {
+  if (!facilityId) throw validationError("facilityId query parameter is required");
+  await requireFacility(user.organizationId, facilityId);
+  sendJson(res, { status: 200, body: await repo.listAiAnalyses(user.organizationId, facilityId) });
+}
+
+async function reviewEvidenceAi(req, res, user, evidenceId) {
+  requireRole(user, ["admin", "reviewer"]);
+  const reviewInput = parseAiReviewInput(await readJson(req));
+  const reviewed = await evidenceAiService.reviewEvidence({ organizationId: user.organizationId, evidenceId, reviewer: user, reviewInput });
+  if (!reviewed) {
+    const error = new Error("AI analysis not found");
+    error.status = 404;
+    throw error;
+  }
+  const facility = await requireFacility(user.organizationId, reviewed.evidence.facilityId);
+  const generated = await generateAndPersistReview(user, facility);
+  sendJson(res, { status: 200, body: { ...reviewed, ...generated } });
 }
 
 async function listReviews(res, user, facilityId) {
@@ -301,8 +397,9 @@ async function exportPacket(req, res, user) {
   const gapRows = await repo.getGapRows(user.organizationId, review.id);
   const actionItems = await repo.getActionItems(user.organizationId, review.id);
   const findings = await repo.getFindings(user.organizationId, review.id);
+  const aiAnalyses = await repo.listAiAnalyses(user.organizationId, facility.id);
   const rulesPack = await repo.getRulesPack(review.rulesPackId) || RULES_PACKS.find((pack) => pack.rulesPackId === review.rulesPackId);
-  const pdf = generateAuditPacketPdf({ facility, review, gapRows, actionItems, evidence, rulesPack, findings });
+  const pdf = generateAuditPacketPdf({ facility, review, gapRows, actionItems, evidence, rulesPack, findings, aiAnalyses });
   const title = "Industrial Audit Readiness Packet";
   const saved = await storage.saveBuffer(pdf, `audit-packet-${facility.name}.pdf`);
   let packet;
@@ -323,7 +420,7 @@ async function exportPacket(req, res, user) {
     await storage.deleteBuffer(saved.fileReference);
     throw error;
   }
-  await audit(user, facility.id, "packet.exported", "audit_packet", packet.id, { reviewId: review.id });
+  await audit(user, facility.id, aiAnalyses.length ? "packet_exported_with_ai_lineage" : "packet.exported", "audit_packet", packet.id, { reviewId: review.id, aiAnalysisCount: aiAnalyses.length });
   sendJson(res, { status: 201, body: { packet, downloadUrl: `/api/audit-packets/${packet.id}/download` } });
 }
 
@@ -497,7 +594,7 @@ function match(path, pattern) {
 
 function params(path) {
   const parts = path.split("/").filter(Boolean);
-  const id = parts[parts.length - 1] === "download" || parts[parts.length - 1] === "gap-matrix" || parts[parts.length - 1] === "score" || parts[parts.length - 1] === "action-plan" || parts[parts.length - 1] === "applicable-rules"
+  const id = ["download", "gap-matrix", "score", "action-plan", "applicable-rules", "process-ai", "ai-analysis", "ai-review"].includes(parts[parts.length - 1])
     ? parts[parts.length - 2]
     : parts[parts.length - 1];
   return { id };
@@ -505,6 +602,15 @@ function params(path) {
 
 function safeDownloadName(name) {
   return String(name || "download").replace(/[^a-z0-9_-]+/gi, "-").slice(0, 80);
+}
+
+function safeOriginalFileName(name) {
+  return String(name || "evidence.bin").split(/[\\/]/).pop().replace(/[^a-z0-9._ -]+/gi, "-").slice(0, 180) || "evidence.bin";
+}
+
+function normalizeContentType(value) {
+  const contentType = String(value || "application/octet-stream").trim().toLowerCase();
+  return /^[a-z0-9.+-]+\/[a-z0-9.+-]+$/.test(contentType) ? contentType : "application/octet-stream";
 }
 
 function decodeBase64(value) {

@@ -12,6 +12,10 @@ test("API requires auth and blocks cross-organization access", async () => {
   process.env.UPLOAD_DIR = path.join(dir, "private-storage");
   process.env.MAX_UPLOAD_MB = "5";
   process.env.SESSION_SECRET = "test-session-secret-with-enough-length";
+  process.env.AI_ENABLED = "true";
+  process.env.AI_PROVIDER = "mock";
+  process.env.AI_CONFIDENCE_THRESHOLD = "0.8";
+  process.env.AI_REVIEW_REQUIRED_THRESHOLD = "0.7";
 
   const { server, repo } = await import("../apps/api/src/server.js");
   const { hashPassword } = await import("../apps/api/src/security.js");
@@ -23,6 +27,7 @@ test("API requires auth and blocks cross-organization access", async () => {
     const orgA = await repo.createOrganization({ name: "Tenant A" });
     const orgB = await repo.createOrganization({ name: "Tenant B" });
     const user = await repo.createUser({ organizationId: orgA.id, email: "admin@example.com", passwordHash: await hashPassword("Password#2026"), name: "Admin", role: "admin", isActive: true });
+    const viewer = await repo.createUser({ organizationId: orgA.id, email: "viewer@example.com", passwordHash: await hashPassword("Password#2026"), name: "Viewer", role: "compliance_manager", isActive: true });
     const userB = await repo.createUser({ organizationId: orgB.id, email: "other@example.com", passwordHash: await hashPassword("Password#2026"), name: "Other Admin", role: "admin", isActive: true });
     const facility = await repo.createFacility({
       organizationId: orgA.id,
@@ -100,13 +105,33 @@ test("API requires auth and blocks cross-organization access", async () => {
         facilityId: facility.id,
         title: "LOTO procedure",
         evidenceType: "loto_procedures",
-        status: "accepted",
+        status: "pending",
         contentBase64: Buffer.from("loto procedure").toString("base64"),
         fileName: "loto.txt"
       })
     });
     assert.equal(upload.status, 201);
     const evidence = await upload.json();
+    assert.equal(evidence.aiAnalysis.detectedEvidenceType, "loto_procedures");
+    assert.equal(evidence.aiAnalysis.provider, "mock");
+
+    assert.equal((await fetch(`${base}/api/evidence/${evidence.id}/process-ai`, { method: "POST" })).status, 401);
+    const analysisResponse = await fetch(`${base}/api/evidence/${evidence.id}/ai-analysis`, { headers: { cookie } });
+    assert.equal(analysisResponse.status, 200);
+    assert.equal((await analysisResponse.json()).needsHumanReview, false);
+
+    const acceptClassification = await fetch(`${base}/api/evidence/${evidence.id}/ai-review`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ action: "accept_ai", notes: "Classification reviewed." })
+    });
+    assert.equal(acceptClassification.status, 200);
+    const markAccepted = await fetch(`${base}/api/evidence/${evidence.id}/ai-review`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ action: "mark_accepted", notes: "Evidence reviewed and accepted for this packet." })
+    });
+    assert.equal(markAccepted.status, 200);
 
     const evidenceDownload = await fetch(`${base}/api/evidence/${evidence.id}/download`, { headers: { cookie } });
     assert.equal(evidenceDownload.status, 200);
@@ -133,7 +158,9 @@ test("API requires auth and blocks cross-organization access", async () => {
 
     const packetDownload = await fetch(`${base}/api/audit-packets/${packet.id}/download`, { headers: { cookie } });
     assert.equal(packetDownload.status, 200);
-    assert.equal((await packetDownload.arrayBuffer()).byteLength > 4, true);
+    const packetBuffer = Buffer.from(await packetDownload.arrayBuffer());
+    assert.equal(packetBuffer.byteLength > 4, true);
+    assert.match(packetBuffer.toString("utf8"), /AI-assisted evidence analysis/);
 
     assert.equal((await fetch(`${base}/api/evidence/${evidence.id}/download`)).status, 401);
     assert.equal((await fetch(`${base}/api/audit-packets/${packet.id}/download`)).status, 401);
@@ -146,6 +173,19 @@ test("API requires auth and blocks cross-organization access", async () => {
     assert.equal(loginB.status, 200);
     const cookieB = loginB.headers.get("set-cookie").split(";")[0];
 
+    const loginViewer = await fetch(`${base}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: viewer.email, password: "Password#2026" })
+    });
+    const viewerCookie = loginViewer.headers.get("set-cookie").split(";")[0];
+    const deniedReview = await fetch(`${base}/api/evidence/${evidence.id}/ai-review`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", cookie: viewerCookie },
+      body: JSON.stringify({ action: "mark_rejected" })
+    });
+    assert.equal(deniedReview.status, 403);
+
     const deniedEvidence = await fetch(`${base}/api/evidence/${evidence.id}/download`, { headers: { cookie: cookieB } });
     assert.equal(deniedEvidence.status, 403);
     const deniedPacket = await fetch(`${base}/api/audit-packets/${packet.id}/download`, { headers: { cookie: cookieB } });
@@ -154,6 +194,12 @@ test("API requires auth and blocks cross-organization access", async () => {
     assert.equal(deniedGapMatrix.status, 403);
     const deniedAuditLogs = await fetch(`${base}/api/audit-logs?facilityId=${facility.id}`, { headers: { cookie: cookieB } });
     assert.equal(deniedAuditLogs.status, 403);
+    const deniedAnalysis = await fetch(`${base}/api/evidence/${evidence.id}/ai-analysis`, { headers: { cookie: cookieB } });
+    assert.equal(deniedAnalysis.status, 403);
+    const auditLogs = await repo.listAuditLogs(orgA.id, facility.id);
+    assert.ok(auditLogs.some((entry) => entry.action === "ai_classification_generated"));
+    assert.ok(auditLogs.some((entry) => entry.action === "human_accepted_ai_result"));
+    assert.ok(auditLogs.some((entry) => entry.action === "packet_exported_with_ai_lineage"));
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }

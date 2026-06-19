@@ -44,3 +44,19 @@ test("repository config requires Postgres in production without requiring unrela
   assert.equal(config.repositoryBackend, "postgres");
   assert.equal(config.databaseUrl, productionEnv.DATABASE_URL);
 });
+
+test("AI is optional and OpenAI configuration is required only when enabled", () => {
+  const disabled = readConfig({ NODE_ENV: "development", REPOSITORY_BACKEND: "file", AI_ENABLED: "false" });
+  assert.equal(disabled.aiEnabled, false);
+  assert.throws(() => readConfig({ NODE_ENV: "development", REPOSITORY_BACKEND: "file", AI_ENABLED: "true" }), /OPENAI_API_KEY and OPENAI_MODEL/);
+  const mock = readConfig({
+    NODE_ENV: "development",
+    REPOSITORY_BACKEND: "file",
+    AI_ENABLED: "true",
+    AI_PROVIDER: "mock",
+    AI_CONFIDENCE_THRESHOLD: "0.8",
+    AI_REVIEW_REQUIRED_THRESHOLD: "0.7"
+  });
+  assert.equal(mock.aiProvider, "mock");
+  assert.throws(() => readConfig({ ...productionEnv, AI_ENABLED: "true", AI_PROVIDER: "mock" }), /not allowed in production/);
+});

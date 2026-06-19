@@ -71,6 +71,24 @@ export function readConfig(env = process.env) {
     throw new Error("MAX_UPLOAD_MB must be a positive integer");
   }
 
+  const aiEnabled = env.AI_ENABLED === "true";
+  const aiProvider = env.AI_PROVIDER || "openai";
+  const aiMaxFileTextChars = positiveInteger(env.AI_MAX_FILE_TEXT_CHARS || "12000", "AI_MAX_FILE_TEXT_CHARS");
+  const aiConfidenceThreshold = unitInterval(env.AI_CONFIDENCE_THRESHOLD || "0.8", "AI_CONFIDENCE_THRESHOLD");
+  const aiReviewRequiredThreshold = unitInterval(env.AI_REVIEW_REQUIRED_THRESHOLD || "0.7", "AI_REVIEW_REQUIRED_THRESHOLD");
+  if (aiReviewRequiredThreshold > aiConfidenceThreshold) {
+    throw new Error("AI_REVIEW_REQUIRED_THRESHOLD must be less than or equal to AI_CONFIDENCE_THRESHOLD");
+  }
+  if (aiEnabled && !["openai", "mock"].includes(aiProvider)) {
+    throw new Error("AI_PROVIDER must be openai or mock when AI is enabled");
+  }
+  if (isProduction && aiEnabled && aiProvider === "mock") {
+    throw new Error("AI_PROVIDER=mock is not allowed in production");
+  }
+  if (aiEnabled && aiProvider === "openai" && (!env.OPENAI_API_KEY || !env.OPENAI_MODEL)) {
+    throw new Error("OPENAI_API_KEY and OPENAI_MODEL are required when AI_ENABLED=true and AI_PROVIDER=openai");
+  }
+
   return {
     nodeEnv,
     isProduction,
@@ -86,6 +104,25 @@ export function readConfig(env = process.env) {
     maxUploadMb,
     enableDemoData: env.ENABLE_DEMO_DATA === "true",
     adminEmail: env.ADMIN_EMAIL || "admin@complianceiq.local",
-    adminPassword: env.ADMIN_PASSWORD || ""
+    adminPassword: env.ADMIN_PASSWORD || "",
+    aiEnabled,
+    aiProvider,
+    aiMaxFileTextChars,
+    aiConfidenceThreshold,
+    aiReviewRequiredThreshold,
+    openAiApiKey: env.OPENAI_API_KEY || "",
+    openAiModel: env.OPENAI_MODEL || ""
   };
+}
+
+function positiveInteger(value, name) {
+  const parsed = Number.parseInt(String(value), 10);
+  if (!Number.isInteger(parsed) || parsed <= 0) throw new Error(`${name} must be a positive integer`);
+  return parsed;
+}
+
+function unitInterval(value, name) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) throw new Error(`${name} must be between 0 and 1`);
+  return parsed;
 }

@@ -186,9 +186,9 @@ export class PostgresRepository {
     }
     const id = input.id || this.createId();
     const [row] = await this.query(
-      `INSERT INTO evidence (id, organization_id, facility_id, title, description, evidence_type, file_reference, uploaded_by_user_id, country, region, related_obligation_id, document_date, expiration_date, status, confidence, reviewer_notes, archived)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING *`,
-      [id, input.organizationId, input.facilityId, input.title, input.description, input.evidenceType, input.fileReference, input.uploadedByUserId, input.country, input.region, input.relatedObligationId, input.documentDate, input.expirationDate, input.status, input.confidence, input.reviewerNotes, input.archived ?? false]
+      `INSERT INTO evidence (id, organization_id, facility_id, title, description, evidence_type, file_reference, file_name, content_type, file_size_bytes, file_sha256, uploaded_by_user_id, country, region, related_obligation_id, document_date, expiration_date, status, confidence, reviewer_notes, archived)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21) RETURNING *`,
+      [id, input.organizationId, input.facilityId, input.title, input.description, input.evidenceType, input.fileReference, input.fileName, input.contentType, input.fileSizeBytes, input.fileSha256, input.uploadedByUserId, input.country, input.region, input.relatedObligationId, input.documentDate, input.expirationDate, input.status, input.confidence, input.reviewerNotes, input.archived ?? false]
     );
     return camelEvidence(row);
   }
@@ -205,15 +205,123 @@ export class PostgresRepository {
     const current = await this.getEvidence(organizationId, id);
     const next = { ...current, ...updates };
     const [row] = await this.query(
-      `UPDATE evidence SET title=$3, description=$4, evidence_type=$5, file_reference=$6, country=$7, region=$8, related_obligation_id=$9, document_date=$10, expiration_date=$11, status=$12, confidence=$13, reviewer_notes=$14, archived=$15, updated_at=now()
+      `UPDATE evidence SET title=$3, description=$4, evidence_type=$5, file_reference=$6, file_name=$7, content_type=$8, file_size_bytes=$9, file_sha256=$10, country=$11, region=$12, related_obligation_id=$13, document_date=$14, expiration_date=$15, status=$16, confidence=$17, reviewer_notes=$18, archived=$19, updated_at=now()
        WHERE organization_id=$1 AND id=$2 RETURNING *`,
-      [organizationId, id, next.title, next.description, next.evidenceType, next.fileReference, next.country, next.region, next.relatedObligationId, next.documentDate, next.expirationDate, next.status, next.confidence, next.reviewerNotes, next.archived]
+      [organizationId, id, next.title, next.description, next.evidenceType, next.fileReference, next.fileName, next.contentType, next.fileSizeBytes, next.fileSha256, next.country, next.region, next.relatedObligationId, next.documentDate, next.expirationDate, next.status, next.confidence, next.reviewerNotes, next.archived]
     );
     return camelEvidence(row);
   }
 
   async archiveEvidence(organizationId, id) {
     return this.updateEvidence(organizationId, id, { archived: true });
+  }
+
+  async upsertAiAnalysis(input) {
+    const evidence = await this.getEvidence(input.organizationId, input.evidenceId);
+    if (evidence.facilityId !== input.facilityId) throw forbidden("AI analysis facility does not match the evidence facility");
+    const id = input.id || this.createId();
+    const values = [
+      id, input.organizationId, input.facilityId, input.evidenceId, input.reviewId, input.processingStatus,
+      input.textExtractionStatus, input.detectedEvidenceType, input.detectedTitle, input.extractedDocumentDate,
+      input.extractedExpirationDate, input.extractedFacilityName, JSON.stringify(input.extractedEmployeeNames || []),
+      JSON.stringify(input.extractedEquipmentNames || []), JSON.stringify(input.extractedChemicalNames || []),
+      input.extractedSignaturePresent, JSON.stringify(input.extractedAuthorityMentions || []),
+      JSON.stringify(input.extractedCitationMentions || []), input.summary, JSON.stringify(input.issues || []),
+      input.suggestedRuleId, input.suggestedObligationTitle, input.matchReason,
+      JSON.stringify(input.missingFieldsOrIssues || []), input.confidence, input.needsHumanReview,
+      input.provider, input.model, input.promptVersion, input.rawModelOutputReference, input.error,
+      input.humanReviewed ?? false, input.humanAcceptedAiResult ?? false, input.humanReviewerId,
+      input.humanReviewedAt, input.humanOverrideEvidenceType, input.humanOverrideRuleId, input.humanReviewNotes
+    ];
+    const [row] = await this.query(
+      `INSERT INTO evidence_ai_analyses (
+         id, organization_id, facility_id, evidence_id, review_id, processing_status, text_extraction_status,
+         detected_evidence_type, detected_title, extracted_document_date, extracted_expiration_date,
+         extracted_facility_name, extracted_employee_names, extracted_equipment_names, extracted_chemical_names,
+         extracted_signature_present, extracted_authority_mentions, extracted_citation_mentions, summary, issues,
+         suggested_rule_id, suggested_obligation_title, match_reason, missing_fields_or_issues, confidence,
+         needs_human_review, provider, model, prompt_version, raw_model_output_reference, error, human_reviewed,
+         human_accepted_ai_result, human_reviewer_id, human_reviewed_at, human_override_evidence_type,
+         human_override_rule_id, human_review_notes
+       ) VALUES (${values.map((_, index) => `$${index + 1}`).join(",")})
+       ON CONFLICT (evidence_id) DO UPDATE SET
+         review_id=EXCLUDED.review_id, processing_status=EXCLUDED.processing_status,
+         text_extraction_status=EXCLUDED.text_extraction_status, detected_evidence_type=EXCLUDED.detected_evidence_type,
+         detected_title=EXCLUDED.detected_title, extracted_document_date=EXCLUDED.extracted_document_date,
+         extracted_expiration_date=EXCLUDED.extracted_expiration_date, extracted_facility_name=EXCLUDED.extracted_facility_name,
+         extracted_employee_names=EXCLUDED.extracted_employee_names, extracted_equipment_names=EXCLUDED.extracted_equipment_names,
+         extracted_chemical_names=EXCLUDED.extracted_chemical_names, extracted_signature_present=EXCLUDED.extracted_signature_present,
+         extracted_authority_mentions=EXCLUDED.extracted_authority_mentions, extracted_citation_mentions=EXCLUDED.extracted_citation_mentions,
+         summary=EXCLUDED.summary, issues=EXCLUDED.issues, suggested_rule_id=EXCLUDED.suggested_rule_id,
+         suggested_obligation_title=EXCLUDED.suggested_obligation_title, match_reason=EXCLUDED.match_reason,
+         missing_fields_or_issues=EXCLUDED.missing_fields_or_issues, confidence=EXCLUDED.confidence,
+         needs_human_review=EXCLUDED.needs_human_review, provider=EXCLUDED.provider, model=EXCLUDED.model,
+         prompt_version=EXCLUDED.prompt_version, raw_model_output_reference=EXCLUDED.raw_model_output_reference,
+         error=EXCLUDED.error, human_reviewed=EXCLUDED.human_reviewed,
+         human_accepted_ai_result=EXCLUDED.human_accepted_ai_result, human_reviewer_id=EXCLUDED.human_reviewer_id,
+         human_reviewed_at=EXCLUDED.human_reviewed_at, human_override_evidence_type=EXCLUDED.human_override_evidence_type,
+         human_override_rule_id=EXCLUDED.human_override_rule_id, human_review_notes=EXCLUDED.human_review_notes,
+         updated_at=now()
+       RETURNING *`,
+      values
+    );
+    return camelAiAnalysis(row);
+  }
+
+  async getAiAnalysis(organizationId, evidenceId) {
+    await this.getEvidence(organizationId, evidenceId);
+    const [row] = await this.query("SELECT * FROM evidence_ai_analyses WHERE organization_id=$1 AND evidence_id=$2", [organizationId, evidenceId]);
+    return row ? camelAiAnalysis(row) : null;
+  }
+
+  async listAiAnalyses(organizationId, facilityId) {
+    await this.getFacility(organizationId, facilityId);
+    return (await this.query(
+      "SELECT * FROM evidence_ai_analyses WHERE organization_id=$1 AND facility_id=$2 ORDER BY updated_at DESC",
+      [organizationId, facilityId]
+    )).map(camelAiAnalysis);
+  }
+
+  async applyAiHumanReview(input) {
+    const evidence = await this.getEvidence(input.organizationId, input.evidenceId);
+    const analysis = await this.getAiAnalysis(input.organizationId, input.evidenceId);
+    if (!analysis) return null;
+    const nextEvidence = { ...evidence, ...input.evidenceUpdates };
+    const nextAnalysis = { ...analysis, ...input.analysisUpdates };
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const evidenceResult = await client.query(
+        `UPDATE evidence SET evidence_type=$3, related_obligation_id=$4, document_date=$5, expiration_date=$6,
+           status=$7, confidence=$8, reviewer_notes=$9, updated_at=now()
+         WHERE organization_id=$1 AND id=$2 RETURNING *`,
+        [input.organizationId, input.evidenceId, nextEvidence.evidenceType, nextEvidence.relatedObligationId,
+          nextEvidence.documentDate, nextEvidence.expirationDate, nextEvidence.status, nextEvidence.confidence,
+          nextEvidence.reviewerNotes]
+      );
+      const analysisResult = await client.query(
+        `UPDATE evidence_ai_analyses SET human_reviewed=$3, human_accepted_ai_result=$4, human_reviewer_id=$5,
+           human_reviewed_at=$6, human_override_evidence_type=$7, human_override_rule_id=$8,
+           human_review_notes=$9, needs_human_review=$10, updated_at=now()
+         WHERE organization_id=$1 AND evidence_id=$2 RETURNING *`,
+        [input.organizationId, input.evidenceId, nextAnalysis.humanReviewed, nextAnalysis.humanAcceptedAiResult,
+          nextAnalysis.humanReviewerId, nextAnalysis.humanReviewedAt, nextAnalysis.humanOverrideEvidenceType,
+          nextAnalysis.humanOverrideRuleId, nextAnalysis.humanReviewNotes, nextAnalysis.needsHumanReview]
+      );
+      await client.query(
+        `INSERT INTO audit_logs (id, organization_id, facility_id, actor_user_id, action, entity_type, entity_id, metadata)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [this.createId(), input.organizationId, evidence.facilityId, input.reviewerId, input.auditAction,
+          "evidence_ai_analysis", analysis.id, JSON.stringify(input.auditMetadata || {})]
+      );
+      await client.query("COMMIT");
+      return { evidence: camelEvidence(evidenceResult.rows[0]), analysis: camelAiAnalysis(analysisResult.rows[0]) };
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   async listRulesPacks() {
@@ -469,7 +577,28 @@ function camelFacility(row) {
 }
 
 function camelEvidence(row) {
-  return { id: row.id, organizationId: row.organization_id, facilityId: row.facility_id, title: row.title, description: row.description, evidenceType: row.evidence_type, fileReference: row.file_reference, uploadedByUserId: row.uploaded_by_user_id, country: row.country, region: row.region, relatedObligationId: row.related_obligation_id, documentDate: row.document_date, expirationDate: row.expiration_date, status: row.status, confidence: row.confidence, reviewerNotes: row.reviewer_notes, archived: row.archived, createdAt: row.created_at, updatedAt: row.updated_at };
+  return { id: row.id, organizationId: row.organization_id, facilityId: row.facility_id, title: row.title, description: row.description, evidenceType: row.evidence_type, fileReference: row.file_reference, fileName: row.file_name, contentType: row.content_type, fileSizeBytes: row.file_size_bytes === null ? null : Number(row.file_size_bytes), fileSha256: row.file_sha256, uploadedByUserId: row.uploaded_by_user_id, country: row.country, region: row.region, relatedObligationId: row.related_obligation_id, documentDate: row.document_date, expirationDate: row.expiration_date, status: row.status, confidence: row.confidence, reviewerNotes: row.reviewer_notes, archived: row.archived, createdAt: row.created_at, updatedAt: row.updated_at };
+}
+
+function camelAiAnalysis(row) {
+  return {
+    id: row.id, organizationId: row.organization_id, facilityId: row.facility_id, evidenceId: row.evidence_id,
+    reviewId: row.review_id, processingStatus: row.processing_status, textExtractionStatus: row.text_extraction_status,
+    detectedEvidenceType: row.detected_evidence_type, detectedTitle: row.detected_title,
+    extractedDocumentDate: row.extracted_document_date, extractedExpirationDate: row.extracted_expiration_date,
+    extractedFacilityName: row.extracted_facility_name, extractedEmployeeNames: row.extracted_employee_names,
+    extractedEquipmentNames: row.extracted_equipment_names, extractedChemicalNames: row.extracted_chemical_names,
+    extractedSignaturePresent: row.extracted_signature_present, extractedAuthorityMentions: row.extracted_authority_mentions,
+    extractedCitationMentions: row.extracted_citation_mentions, summary: row.summary, issues: row.issues,
+    suggestedRuleId: row.suggested_rule_id, suggestedObligationTitle: row.suggested_obligation_title,
+    matchReason: row.match_reason, missingFieldsOrIssues: row.missing_fields_or_issues, confidence: row.confidence,
+    needsHumanReview: row.needs_human_review, provider: row.provider, model: row.model, promptVersion: row.prompt_version,
+    rawModelOutputReference: row.raw_model_output_reference, error: row.error, humanReviewed: row.human_reviewed,
+    humanAcceptedAiResult: row.human_accepted_ai_result, humanReviewerId: row.human_reviewer_id,
+    humanReviewedAt: row.human_reviewed_at, humanOverrideEvidenceType: row.human_override_evidence_type,
+    humanOverrideRuleId: row.human_override_rule_id, humanReviewNotes: row.human_review_notes,
+    createdAt: row.created_at, updatedAt: row.updated_at
+  };
 }
 
 function camelRulesPack(row) {

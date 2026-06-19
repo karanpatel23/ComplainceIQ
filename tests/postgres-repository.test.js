@@ -40,6 +40,18 @@ test("postgres repository persists facilities, evidence, reviews, matches, and p
     }, org.id, user.id));
     const generated = generateReview({ facility, evidence: [evidence], now: new Date("2026-06-18T12:00:00Z") });
     await repo.saveApplicableRules(org.id, facility.id, generated.rulesPack.rulesPackId, generated.applicableRules);
+    await repo.upsertAiAnalysis({
+      organizationId: org.id, facilityId: facility.id, evidenceId: evidence.id, reviewId: null,
+      processingStatus: "processed", textExtractionStatus: "extracted", detectedEvidenceType: "loto_procedures",
+      detectedTitle: "LOTO procedure", extractedDocumentDate: "2026-01-01", extractedExpirationDate: null,
+      extractedFacilityName: null, extractedEmployeeNames: [], extractedEquipmentNames: [], extractedChemicalNames: [],
+      extractedSignaturePresent: null, extractedAuthorityMentions: [], extractedCitationMentions: [], summary: "LOTO evidence",
+      issues: [], suggestedRuleId: "us-loto-procedures", suggestedObligationTitle: "Lockout/Tagout written procedures",
+      matchReason: "Type agreement", missingFieldsOrIssues: [], confidence: 0.9, needsHumanReview: false,
+      provider: "mock", model: "mock-evidence-v1", promptVersion: "evidence-intelligence-v1",
+      rawModelOutputReference: null, error: null, humanReviewed: false, humanAcceptedAiResult: false,
+      humanReviewerId: null, humanReviewedAt: null, humanOverrideEvidenceType: null, humanOverrideRuleId: null, humanReviewNotes: null
+    });
     const review = await repo.createReview({
       organizationId: org.id,
       facilityId: facility.id,
@@ -83,6 +95,7 @@ test("postgres repository persists facilities, evidence, reviews, matches, and p
       assert.equal((await restarted.getGapRows(org.id, review.id)).length, generated.gapRows.length);
       assert.equal((await restarted.getActionItems(org.id, review.id)).length, generated.actionPlan.length);
       assert.ok((await restarted.getEvidenceMatches(org.id, facility.id)).some((match) => match.evidenceId === evidence.id));
+      assert.equal((await restarted.getAiAnalysis(org.id, evidence.id)).detectedEvidenceType, "loto_procedures");
       assert.equal((await restarted.listAuditPackets(org.id, facility.id))[0].id, packet.id);
       assert.ok((await restarted.listAuditLogs(org.id, facility.id)).some((entry) => entry.action === "packet.exported"));
     } finally {

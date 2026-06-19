@@ -4,6 +4,41 @@ export const PRIORITIES = ["critical", "high", "medium", "low"];
 export const EVIDENCE_STATUSES = ["pending", "accepted", "rejected", "expired", "needs_review"];
 export const GAP_STATUSES = ["missing", "partial", "accepted", "rejected", "expired", "not_applicable"];
 export const USER_ROLES = ["admin", "compliance_manager", "reviewer", "auditor", "executive"];
+export const EVIDENCE_TAXONOMY = [
+  "chemical_inventory",
+  "chemical_training_records",
+  "corrective_action_records",
+  "emergency_action_plan",
+  "emergency_drill_records",
+  "emergency_training_records",
+  "fire_extinguisher_inspections",
+  "fit_test_records",
+  "forklift_training_records",
+  "hazardous_waste_determination",
+  "hazardous_waste_manifests",
+  "hazcom_training_records",
+  "hearing_training_records",
+  "incident_log",
+  "loto_procedures",
+  "loto_training_records",
+  "machine_guarding_inspections",
+  "maintenance_logs",
+  "noise_monitoring_records",
+  "osha_300_log",
+  "osha_300a_summary",
+  "other",
+  "ppe_hazard_assessment",
+  "ppe_training_records",
+  "respiratory_program",
+  "respiratory_training_records",
+  "safety_training_records",
+  "sds_library",
+  "spcc_plan",
+  "spcc_threshold_review",
+  "waste_area_inspections",
+  "whmis_training_records",
+  "written_hazcom_program"
+];
 
 export function newId(prefix = "id") {
   const bytes = crypto.getRandomValues
@@ -121,8 +156,12 @@ export function parseEvidenceInput(input, organizationId, uploadedByUserId) {
     facilityId: requiredString(input.facilityId, "facilityId"),
     title: requiredString(input.title, "title"),
     description: optionalString(input.description),
-    evidenceType: requiredString(input.evidenceType, "evidenceType"),
+    evidenceType: normalizeEvidenceType(input.evidenceType),
     fileReference: optionalString(input.fileReference),
+    fileName: optionalString(input.fileName),
+    contentType: optionalString(input.contentType),
+    fileSizeBytes: optionalInteger(input.fileSizeBytes),
+    fileSha256: optionalString(input.fileSha256),
     uploadedByUserId,
     country,
     region,
@@ -134,6 +173,14 @@ export function parseEvidenceInput(input, organizationId, uploadedByUserId) {
     reviewerNotes: optionalString(input.reviewerNotes),
     archived: Boolean(input.archived ?? false)
   };
+}
+
+export function normalizeEvidenceType(value) {
+  const evidenceType = requiredString(value, "evidenceType");
+  if (!EVIDENCE_TAXONOMY.includes(evidenceType)) {
+    throw validationError(`evidenceType must be one of: ${EVIDENCE_TAXONOMY.join(", ")}`);
+  }
+  return evidenceType;
 }
 
 export function normalizeEvidenceStatus(status) {

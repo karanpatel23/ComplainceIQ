@@ -2,7 +2,7 @@
 
 Industrial Audit Readiness Platform for Manufacturers.
 
-ComplianceIQ helps manufacturers organize compliance evidence, identify jurisdiction-specific audit gaps, assign corrective actions, and export professional audit-readiness packets. The product is intentionally narrow: facility setup, evidence logging, evidence gap matrix, action plan, and audit packet export.
+ComplianceIQ helps manufacturers organize compliance evidence, use optional AI-assisted classification to structure uploaded documents, identify jurisdiction-specific audit gaps, assign corrective actions, and export professional audit-readiness packets. The product remains intentionally narrow: facility setup, evidence intelligence, evidence gap matrix, action plan, and audit packet export.
 
 ## Product Scope
 
@@ -19,6 +19,7 @@ Starter rules are demo/unverified unless separately expert-reviewed. The system 
 - `apps/api` - Node HTTP API, authentication, tenant scoping, review generation, evidence and packet downloads
 - `apps/web` - focused Audit Packet Builder frontend
 - `packages/config` - environment validation
+- `packages/ai` - validated provider abstraction, bounded extraction, and AI evidence contracts
 - `packages/db` - tracked Postgres migrations plus production Postgres and development file repositories
 - `packages/rules` - jurisdiction-specific rules packs, applicability, gap matrix, scoring, action plan
 - `packages/pdf` - backend audit packet PDF generation
@@ -53,9 +54,49 @@ Optional:
 - `TEST_DATABASE_URL`
 - `OPENAI_API_KEY`
 - `OPENAI_MODEL`
+- `AI_ENABLED`
+- `AI_PROVIDER`
+- `AI_MAX_FILE_TEXT_CHARS`
+- `AI_CONFIDENCE_THRESHOLD`
+- `AI_REVIEW_REQUIRED_THRESHOLD`
 - SMTP variables
 
 OpenAI and SMTP are optional. The core audit packet workflow works without them.
+
+## AI Evidence Intelligence
+
+AI Evidence Intelligence is an optional backend-only evidence organization layer. For supported text files it:
+
+1. extracts bounded text and basic metadata;
+2. classifies into the centralized evidence taxonomy;
+3. extracts dates, names, equipment, chemicals, signatures, authority mentions, and issues when supported by the text;
+4. suggests at most one applicable facility obligation;
+5. stores confidence, provider/model lineage, processing status, and human-review state;
+6. leaves deterministic rules and human decisions as the final authority.
+
+AI does not provide legal advice, certify evidence, approve regulatory status, or decide that a facility is compliant. AI-only suggestions do not become accepted evidence. Manual selections and human overrides win; expired and rejected evidence never count as accepted.
+
+The implemented providers are:
+
+- `openai`: optional Responses API structured output, enabled only with explicit configuration.
+- `mock`: deterministic test/development provider; production configuration rejects it.
+- disabled mode: no key or AI dependency is required for the core workflow.
+
+Enable OpenAI-backed analysis only in the backend environment:
+
+```bash
+AI_ENABLED=true
+AI_PROVIDER=openai
+OPENAI_API_KEY=replace-with-secret
+OPENAI_MODEL=replace-with-approved-structured-output-model
+AI_MAX_FILE_TEXT_CHARS=12000
+AI_CONFIDENCE_THRESHOLD=0.8
+AI_REVIEW_REQUIRED_THRESHOLD=0.7
+```
+
+Do not expose `OPENAI_API_KEY` to the web app. Model output is validated against a strict application schema and applicable rule IDs before storage. Raw prompts, extracted document text, and raw model output are not stored.
+
+Supported extraction in this phase is bounded plain text (`.txt`, `.md`, `.csv`, `.json`, `.log`, `.xml`, `.yaml`, `.yml`). PDF files and images/scans are stored privately and marked `needs_review`; OCR and production PDF text extraction are intentionally deferred.
 
 ## Local Setup
 
@@ -212,6 +253,12 @@ Evidence:
 - `PATCH /api/evidence/:id`
 - `DELETE /api/evidence/:id`
 - `GET /api/evidence/:id/download`
+- `POST /api/evidence/:id/process-ai`
+- `GET /api/evidence/:id/ai-analysis`
+- `PATCH /api/evidence/:id/ai-review` (admin/reviewer)
+- `GET /api/evidence-ai-analyses?facilityId=...`
+- `GET /api/evidence-taxonomy`
+- `GET /api/ai/status`
 
 Audit readiness:
 
@@ -248,6 +295,9 @@ Expert review and logs:
 - Expert review requests validate referenced facilities and reviews against the caller's organization.
 - Evidence and packet files are private file references and download through authenticated API routes.
 - Client-supplied private file references are ignored; only backend storage writes can attach files.
+- AI calls occur only on the backend, receive bounded extracted text, and never run inside database transactions.
+- AI analysis and human overrides are tenant-scoped; override actions require admin or reviewer role and create audit events.
+- Raw document text and raw model responses are not stored in AI rows or audit logs.
 - The frontend escapes persisted content before rendering and restores the current session and latest persisted review after reload.
 - `SESSION_SECRET`, `DATABASE_URL`, and production CORS are validated at startup.
 
@@ -294,7 +344,9 @@ Production should replace this with a durable private object storage adapter suc
 ## Known Limitations
 
 - Starter rules are demo/unverified unless expert-reviewed.
-- AI parsing is intentionally not included yet.
+- OCR and PDF/image text extraction are not included; those files require manual review.
+- AI processing is synchronous in this phase; a durable background job queue is still required before high-volume production rollout.
+- The mock provider is for tests/development only and is rejected in production.
 - Local private storage is not a production object-storage solution.
 - A real Postgres integration run still requires a disposable `TEST_DATABASE_URL`; the self-contained suite deliberately does not emulate Postgres.
 - Login rate limiting and account recovery are not implemented yet.
@@ -310,7 +362,7 @@ The application code, authenticated routes, deterministic backend logic, file-ad
 
 ## Next Recommended Sprint
 
-1. Add a durable production object-storage adapter and integration tests for upload, re-download, and deletion failure handling.
-2. Run the Postgres suite in CI against an ephemeral real Postgres service and gate deployments on it.
-3. Add distributed login rate limiting and a production account-recovery flow.
-4. Expand expert-review workflow depth without broadening the product or rules coverage.
+1. Add durable private object storage plus a background processing queue with idempotency and retry controls.
+2. Add vetted PDF text extraction and OCR with malware scanning, file-type verification, and extraction quality metrics.
+3. Run Postgres and AI mock integration suites in CI and add provider contract/evaluation datasets.
+4. Add distributed login and AI-processing rate limits, cost controls, and production account recovery.

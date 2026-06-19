@@ -6,36 +6,16 @@ const state = {
   facilities: [],
   selectedFacilityId: null,
   evidence: [],
+  evidenceTypes: ["other"],
+  aiStatus: { enabled: false, provider: "disabled", model: null },
+  aiAnalyses: [],
+  applicableRules: [],
   latestReview: null,
   gapRows: [],
   actionItems: [],
   packets: [],
   error: ""
 };
-
-const evidenceTypes = [
-  "chemical_inventory",
-  "sds_library",
-  "written_hazcom_program",
-  "hazcom_training_records",
-  "loto_procedures",
-  "loto_training_records",
-  "machine_guarding_inspections",
-  "ppe_hazard_assessment",
-  "ppe_training_records",
-  "respiratory_program",
-  "fit_test_records",
-  "noise_monitoring_records",
-  "osha_300_log",
-  "emergency_action_plan",
-  "fire_extinguisher_inspections",
-  "forklift_training_records",
-  "hazardous_waste_determination",
-  "hazardous_waste_manifests",
-  "spcc_threshold_review",
-  "whmis_training_records",
-  "safety_training_records"
-];
 
 const root = document.querySelector("#app");
 
@@ -93,6 +73,15 @@ function appView() {
           <div class="user-pill">${html(state.user.email)}</div>
         </header>
         ${errorHtml()}
+        <section class="builder-band ai-band">
+          <div>
+            <h2>AI Evidence Intelligence</h2>
+            <p>${state.aiStatus.enabled
+              ? `AI-assisted classification is enabled through ${html(state.aiStatus.provider)}. Suggestions remain subject to deterministic rules and human review.`
+              : "AI analysis is disabled. Manual evidence logging, deterministic gap analysis, review, and packet export remain available."}</p>
+          </div>
+          <span class="status ${state.aiStatus.enabled ? "accepted" : "partial"}">${state.aiStatus.enabled ? "AI enabled" : "AI disabled"}</span>
+        </section>
         <section class="summary-grid">
           <div class="metric"><span>Selected facility</span><strong>${facility ? html(facility.name) : "None"}</strong></div>
           <div class="metric"><span>Jurisdiction</span><strong>${facility ? `${html(facility.country)} / ${html(facility.region)}` : "Select facility"}</strong></div>
@@ -164,27 +153,82 @@ function evidencePanel() {
   const facility = currentFacility();
   return `
     <section class="panel">
-      <h2>Evidence Upload / Logging</h2>
+      <h2>Evidence Upload and Intelligence</h2>
       <form id="evidence-form" class="form-grid compact">
         <input name="title" placeholder="Evidence title" required ${facility ? "" : "disabled"} />
         <select name="evidenceType" required ${facility ? "" : "disabled"}>
-          ${evidenceTypes.map((type) => `<option value="${type}">${type.replaceAll("_", " ")}</option>`).join("")}
+          ${state.evidenceTypes.map((type) => `<option value="${html(type)}">${html(label(type))}</option>`).join("")}
         </select>
         <select name="status">
           <option value="pending">Pending</option>
-          <option value="accepted">Accepted</option>
           <option value="needs_review">Needs review</option>
-          <option value="rejected">Rejected</option>
           <option value="expired">Expired</option>
         </select>
         <input name="expirationDate" type="date" />
+        <label>Private file (optional)<input name="file" type="file" ${facility ? "" : "disabled"} /></label>
         <textarea name="description" placeholder="Notes"></textarea>
-        <button type="submit" ${facility ? "" : "disabled"}>Log Evidence</button>
+        <button type="submit" ${facility ? "" : "disabled"}>Upload or Log Evidence</button>
       </form>
-      <div class="mini-list">
-        ${state.evidence.length ? state.evidence.map((item) => `<div><strong>${html(item.title)}</strong><span>${html(item.evidenceType)} · ${html(item.status)}</span></div>`).join("") : "<p>No evidence logged for this facility.</p>"}
+      <div class="evidence-list">
+        ${state.evidence.length ? state.evidence.map(evidenceCard).join("") : "<p>No evidence logged for this facility.</p>"}
       </div>
     </section>
+  `;
+}
+
+function evidenceCard(item) {
+  const analysis = state.aiAnalyses.find((entry) => entry.evidenceId === item.id);
+  const canReview = ["admin", "reviewer"].includes(state.user.role);
+  return `
+    <article class="evidence-card">
+      <div class="evidence-heading">
+        <div><strong>${html(item.title)}</strong><span>${html(label(item.evidenceType))} · ${html(item.status)}${item.fileName ? ` · ${html(item.fileName)}` : ""}</span></div>
+        <button class="secondary" data-process-ai="${html(item.id)}" ${state.aiStatus.enabled ? "" : "disabled"}>${analysis ? "Reprocess" : "Process with AI"}</button>
+      </div>
+      ${analysis ? aiAnalysisDetails(analysis) : `<p class="muted">No AI analysis yet. ${state.aiStatus.enabled ? "Process this evidence to classify it." : "AI is disabled; manual review remains available."}</p>`}
+      ${analysis && canReview ? aiReviewForm(item, analysis) : ""}
+    </article>
+  `;
+}
+
+function aiAnalysisDetails(analysis) {
+  const confidence = analysis.confidence === null || analysis.confidence === undefined ? "N/A" : `${Math.round(analysis.confidence * 100)}%`;
+  return `
+    <div class="ai-analysis">
+      <div class="badge-row">
+        <span class="status ${analysis.processingStatus === "processed" ? "accepted" : "partial"}">${html(label(analysis.processingStatus))}</span>
+        <span class="status">Confidence ${html(confidence)}</span>
+        <span class="status ${analysis.humanReviewed ? "accepted" : analysis.needsHumanReview ? "partial" : ""}">${analysis.humanReviewed ? "Human reviewed" : analysis.needsHumanReview ? "Needs review" : "AI matched"}</span>
+      </div>
+      <p><strong>Likely type:</strong> ${html(label(analysis.detectedEvidenceType || "other"))}</p>
+      <p>${html(analysis.summary || analysis.error || "No summary available.")}</p>
+      <p><strong>Suggested obligation:</strong> ${html(analysis.suggestedObligationTitle || "No suggestion")}<br><strong>Reason:</strong> ${html(analysis.matchReason || "No AI match reason")}</p>
+      <p><strong>Extracted dates:</strong> ${html(analysis.extractedDocumentDate || "unknown")} / expires ${html(analysis.extractedExpirationDate || "unknown")}</p>
+      <p><strong>Extracted fields:</strong> employees ${html((analysis.extractedEmployeeNames || []).join(", ") || "none")}; equipment ${html((analysis.extractedEquipmentNames || []).join(", ") || "none")}; chemicals ${html((analysis.extractedChemicalNames || []).join(", ") || "none")}; signature ${analysis.extractedSignaturePresent === null ? "unknown" : analysis.extractedSignaturePresent ? "present" : "not detected"}</p>
+      ${(analysis.issues || []).length ? `<ul>${analysis.issues.map((issue) => `<li>${html(issue)}</li>`).join("")}</ul>` : ""}
+    </div>
+  `;
+}
+
+function aiReviewForm(item, analysis) {
+  return `
+    <form class="ai-review-form" data-ai-review="${html(item.id)}">
+      <select name="evidenceType">
+        <option value="">Keep current evidence type</option>
+        ${state.evidenceTypes.map((type) => `<option value="${html(type)}" ${type === (analysis.humanOverrideEvidenceType || analysis.detectedEvidenceType) ? "selected" : ""}>${html(label(type))}</option>`).join("")}
+      </select>
+      <select name="ruleId">
+        <option value="">Keep current obligation match</option>
+        ${state.applicableRules.map((rule) => `<option value="${html(rule.id)}" ${rule.id === (analysis.humanOverrideRuleId || analysis.suggestedRuleId) ? "selected" : ""}>${html(rule.title)}</option>`).join("")}
+      </select>
+      <textarea name="notes" placeholder="Human review notes">${html(analysis.humanReviewNotes || "")}</textarea>
+      <div class="review-actions">
+        <button type="submit" name="action" value="accept_ai">Accept classification</button>
+        <button type="submit" name="action" value="override" class="secondary">Apply override</button>
+        <button type="submit" name="action" value="mark_accepted">Mark evidence accepted</button>
+        <button type="submit" name="action" value="mark_rejected" class="danger-button">Reject evidence</button>
+      </div>
+    </form>
   `;
 }
 
@@ -207,7 +251,7 @@ function gapMatrix() {
       <h2>Evidence Gap Matrix</h2>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Priority</th><th>Status</th><th>Jurisdiction</th><th>Authority</th><th>Citation</th><th>Obligation</th><th>Required Evidence</th><th>Demo</th></tr></thead>
+          <thead><tr><th>Priority</th><th>Status</th><th>Jurisdiction</th><th>Authority</th><th>Citation</th><th>Obligation</th><th>Required Evidence</th><th>AI lineage</th><th>Demo</th></tr></thead>
           <tbody>
             ${state.gapRows.length ? state.gapRows.map((row) => `
               <tr class="${html(row.priority)}">
@@ -218,14 +262,26 @@ function gapMatrix() {
                 <td>${html(row.citation)}</td>
                 <td>${html(row.obligationTitle)}</td>
                 <td>${row.requiredEvidence.map(html).join(", ")}</td>
+                <td>${gapAiInsights(row)}</td>
                 <td>${row.demoContent ? "Unverified" : "Reviewed"}</td>
               </tr>
-            `).join("") : `<tr><td colspan="8">Generate a backend review to populate the matrix.</td></tr>`}
+            `).join("") : `<tr><td colspan="9">Generate a backend review to populate the matrix.</td></tr>`}
           </tbody>
         </table>
       </div>
     </section>
   `;
+}
+
+function gapAiInsights(row) {
+  if (!row.aiInsights?.length) return "No AI suggestion";
+  return row.aiInsights.map((insight) => `
+    <div class="matrix-ai">
+      <strong>${html(label(insight.detectedEvidenceType || "other"))}</strong>
+      <span>${html(insight.matchSource)} · ${insight.confidence === null || insight.confidence === undefined ? "N/A" : `${Math.round(insight.confidence * 100)}%`}</span>
+      <span>${insight.humanReviewed ? "Human reviewed" : insight.needsHumanReview ? "Needs review" : "AI matched"}</span>
+    </div>
+  `).join("");
 }
 
 function actionPlan() {
@@ -250,7 +306,7 @@ function packetPanel() {
     <section class="builder-band">
       <div>
         <h2>Audit Packet Export</h2>
-        <p>Exports are generated from backend-stored facility, evidence, gap matrix, findings, and action plan data.</p>
+        <p>Exports are generated from backend-stored facility, evidence, gap matrix, findings, action plan, and ${state.aiAnalyses.length ? "AI audit-lineage" : "available lineage"} data.</p>
       </div>
       <button id="export-packet" ${state.latestReview ? "" : "disabled"}>Export Packet PDF</button>
     </section>
@@ -285,6 +341,8 @@ function bindEvents() {
   document.querySelector("#evidence-form")?.addEventListener("submit", onCreateEvidence);
   document.querySelector("#generate-review")?.addEventListener("click", onGenerateReview);
   document.querySelector("#export-packet")?.addEventListener("click", onExportPacket);
+  document.querySelectorAll("[data-process-ai]").forEach((button) => button.addEventListener("click", () => onProcessAi(button.dataset.processAi)));
+  document.querySelectorAll("[data-ai-review]").forEach((form) => form.addEventListener("submit", onReviewAi));
   document.querySelectorAll("[data-packet-download]").forEach((button) => button.addEventListener("click", () => onDownloadPacket(button.dataset.packetDownload)));
 }
 
@@ -301,14 +359,18 @@ async function onLogin(event) {
 async function onLogout() {
   await run(async () => {
     await api("/api/auth/logout", { method: "POST", body: {} });
-    Object.assign(state, { user: null, organization: null, facilities: [], selectedFacilityId: null, evidence: [], latestReview: null, gapRows: [], actionItems: [], packets: [] });
+    Object.assign(state, { user: null, organization: null, facilities: [], selectedFacilityId: null, evidence: [], aiAnalyses: [], applicableRules: [], latestReview: null, gapRows: [], actionItems: [], packets: [] });
     render();
   });
 }
 
 async function bootstrap() {
-  state.organization = await api("/api/organization");
-  state.facilities = await api("/api/facilities");
+  [state.organization, state.facilities, state.aiStatus, state.evidenceTypes] = await Promise.all([
+    api("/api/organization"),
+    api("/api/facilities"),
+    api("/api/ai/status"),
+    api("/api/evidence-taxonomy")
+  ]);
   state.selectedFacilityId = state.facilities[0]?.id || null;
   await refreshFacilityData();
 }
@@ -317,6 +379,8 @@ async function refreshFacilityData() {
   const facility = currentFacility();
   if (!facility) {
     state.evidence = [];
+    state.aiAnalyses = [];
+    state.applicableRules = [];
     state.packets = [];
     state.latestReview = null;
     state.gapRows = [];
@@ -325,13 +389,17 @@ async function refreshFacilityData() {
     return;
   }
   const facilityId = encodeURIComponent(facility.id);
-  const [evidence, packets, reviews] = await Promise.all([
+  const [evidence, packets, reviews, aiAnalyses, applicable] = await Promise.all([
     api(`/api/evidence?facilityId=${facilityId}`),
     api(`/api/audit-packets?facilityId=${facilityId}`),
-    api(`/api/audit-readiness/reviews?facilityId=${facilityId}`)
+    api(`/api/audit-readiness/reviews?facilityId=${facilityId}`),
+    api(`/api/evidence-ai-analyses?facilityId=${facilityId}`),
+    api(`/api/facilities/${facilityId}/applicable-rules`)
   ]);
   state.evidence = evidence;
   state.packets = packets;
+  state.aiAnalyses = aiAnalyses;
+  state.applicableRules = applicable.rules || [];
   state.latestReview = reviews[0] || null;
   if (state.latestReview) {
     const reviewId = encodeURIComponent(state.latestReview.id);
@@ -371,10 +439,39 @@ async function onCreateFacility(event) {
 async function onCreateEvidence(event) {
   event.preventDefault();
   const facility = currentFacility();
-  const body = Object.fromEntries(new FormData(event.target));
+  const form = new FormData(event.target);
+  const file = form.get("file");
+  const body = Object.fromEntries([...form.entries()].filter(([key]) => key !== "file"));
   body.facilityId = facility.id;
   await run(async () => {
-    await api("/api/evidence", { method: "POST", body });
+    if (file instanceof File && file.size > 0) {
+      body.fileName = file.name;
+      body.contentType = file.type || "application/octet-stream";
+      body.contentBase64 = await fileToBase64(file);
+      await api("/api/evidence/upload", { method: "POST", body });
+    } else {
+      await api("/api/evidence", { method: "POST", body });
+    }
+    await refreshFacilityData();
+  });
+}
+
+async function onProcessAi(evidenceId) {
+  await run(async () => {
+    await api(`/api/evidence/${encodeURIComponent(evidenceId)}/process-ai`, { method: "POST", body: {} });
+    await refreshFacilityData();
+  });
+}
+
+async function onReviewAi(event) {
+  event.preventDefault();
+  const form = new FormData(event.currentTarget);
+  const action = event.submitter?.value;
+  await run(async () => {
+    await api(`/api/evidence/${encodeURIComponent(event.currentTarget.dataset.aiReview)}/ai-review`, {
+      method: "PATCH",
+      body: { action, evidenceType: form.get("evidenceType"), ruleId: form.get("ruleId"), notes: form.get("notes") }
+    });
     await refreshFacilityData();
   });
 }
@@ -447,6 +544,19 @@ function html(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
+}
+
+function label(value) {
+  return String(value || "").replaceAll("_", " ");
+}
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Could not read the selected file"));
+    reader.onload = () => resolve(String(reader.result).split(",")[1] || "");
+    reader.readAsDataURL(file);
+  });
 }
 
 async function initialize() {

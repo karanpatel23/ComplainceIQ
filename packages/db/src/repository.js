@@ -1,6 +1,6 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import { FileRepository } from "./file-repository.js";
 import { PostgresRepository } from "./postgres-repository.js";
 export { nowIso } from "./time.js";
@@ -22,4 +22,17 @@ export async function createRepository(config) {
 export async function loadInitialMigrationSql() {
   const here = path.dirname(fileURLToPath(import.meta.url));
   return readFile(path.resolve(here, "../migrations/0001_initial.sql"), "utf8");
+}
+
+export async function loadMigrations() {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const migrationsDir = path.resolve(here, "../migrations");
+  const files = (await readdir(migrationsDir))
+    .filter((file) => /^\d+_[a-z0-9_-]+\.sql$/i.test(file))
+    .sort((a, b) => a.localeCompare(b));
+
+  return Promise.all(files.map(async (file) => ({
+    id: file.replace(/\.sql$/, ""),
+    sql: await readFile(path.join(migrationsDir, file), "utf8")
+  })));
 }

@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { RULES_PACKS, COMPLIANCE_RULES } from "../../rules/src/index.js";
@@ -14,6 +14,7 @@ const TABLES = [
   "facilities",
   "facilityApplicableRules",
   "evidence",
+  "evidenceAiAnalyses",
   "evidenceMatches",
   "reviews",
   "gapRows",
@@ -34,7 +35,11 @@ export class FileRepository {
     await mkdir(path.dirname(this.filePath), { recursive: true });
     try {
       this.data = JSON.parse(await readFile(this.filePath, "utf8"));
-    } catch {
+      for (const table of TABLES) {
+        if (!Array.isArray(this.data[table])) this.data[table] = [];
+      }
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
       this.data = Object.fromEntries(TABLES.map((table) => [table, []]));
       await this.persist();
     }
@@ -42,7 +47,14 @@ export class FileRepository {
   }
 
   async persist() {
-    await writeFile(this.filePath, JSON.stringify(this.data, null, 2));
+    const temporaryPath = `${this.filePath}.${process.pid}.${randomUUID()}.tmp`;
+    await writeFile(temporaryPath, JSON.stringify(this.data, null, 2), { mode: 0o600 });
+    await rename(temporaryPath, this.filePath);
+  }
+
+  async healthCheck() {
+    await readFile(this.filePath, "utf8");
+    return { ok: true, backend: "file" };
   }
 
   async seedRules() {
@@ -90,6 +102,9 @@ export class FileRepository {
   }
 
   async createSession(input) {
+    const user = await this.findUserById(input.userId);
+    if (!user || user.organizationId !== input.organizationId) throw forbidden("User does not belong to this organization");
+    this.data.sessions = this.data.sessions.filter((session) => new Date(session.expiresAt).getTime() > Date.now());
     const row = { id: input.id || this.createId(), createdAt: nowIso(), ...input };
     this.data.sessions.push(row);
     await this.persist();
@@ -112,7 +127,7 @@ export class FileRepository {
   }
 
   async createFacility(input) {
-    const row = { id: input.id || this.createId(), createdAt: nowIso(), updatedAt: nowIso(), ...input };
+    const row = { id: input.id || this.createId(), selectedRulesPackId: null, createdAt: nowIso(), updatedAt: nowIso(), ...input };
     this.data.facilities.push(row);
     await this.persist();
     return row;
@@ -138,6 +153,11 @@ export class FileRepository {
   }
 
   async createEvidence(input) {
+    await this.getFacility(input.organizationId, input.facilityId);
+    if (input.uploadedByUserId) {
+      const user = await this.findUserById(input.uploadedByUserId);
+      if (!user || user.organizationId !== input.organizationId) throw forbidden("Uploader does not belong to this organization");
+    }
     const row = { id: input.id || this.createId(), createdAt: nowIso(), updatedAt: nowIso(), ...input };
     this.data.evidence.push(row);
     await this.persist();
@@ -163,19 +183,81 @@ export class FileRepository {
     return this.updateEvidence(organizationId, id, { archived: true });
   }
 
+  async upsertAiAnalysis(input) {
+    const evidence = await this.getEvidence(input.organizationId, input.evidenceId);
+    if (evidence.facilityId !== input.facilityId) throw forbidden("AI analysis facility does not match the evidence facility");
+    const existing = this.data.evidenceAiAnalyses.find((row) => row.evidenceId === input.evidenceId);
+    if (existing && existing.organizationId !== input.organizationId) throw forbidden("AI analysis belongs to another organization");
+    if (existing) {
+      Object.assign(existing, input, { id: existing.id, createdAt: existing.createdAt, updatedAt: nowIso() });
+      await this.persist();
+      return existing;
+    }
+    const row = { id: input.id || this.createId(), createdAt: nowIso(), updatedAt: nowIso(), ...input };
+    this.data.evidenceAiAnalyses.push(row);
+    await this.persist();
+    return row;
+  }
+
+  async getAiAnalysis(organizationId, evidenceId) {
+    await this.getEvidence(organizationId, evidenceId);
+    return this.data.evidenceAiAnalyses.find((row) => row.organizationId === organizationId && row.evidenceId === evidenceId) || null;
+  }
+
+  async listAiAnalyses(organizationId, facilityId) {
+    await this.getFacility(organizationId, facilityId);
+    return this.data.evidenceAiAnalyses
+      .filter((row) => row.organizationId === organizationId && row.facilityId === facilityId)
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  async applyAiHumanReview(input) {
+    const evidence = await this.getEvidence(input.organizationId, input.evidenceId);
+    const analysis = await this.getAiAnalysis(input.organizationId, input.evidenceId);
+    if (!analysis) return null;
+    Object.assign(evidence, input.evidenceUpdates, { updatedAt: nowIso() });
+    Object.assign(analysis, input.analysisUpdates, { updatedAt: nowIso() });
+    this.data.auditLogs.push({
+      id: this.createId(),
+      organizationId: input.organizationId,
+      facilityId: evidence.facilityId,
+      actorUserId: input.reviewerId,
+      action: input.auditAction,
+      entityType: "evidence_ai_analysis",
+      entityId: analysis.id,
+      metadata: input.auditMetadata || {},
+      createdAt: nowIso()
+    });
+    await this.persist();
+    return { evidence, analysis };
+  }
+
   async listRulesPacks() {
     return this.data.rulesPacks;
+  }
+
+  async getRulesPack(rulesPackId) {
+    return this.data.rulesPacks.find((pack) => pack.rulesPackId === rulesPackId) || null;
   }
 
   async listComplianceRules(filters = {}) {
     return this.data.complianceRules.filter((rule) => {
       if (filters.country && rule.country !== filters.country) return false;
       if (filters.rulesPackId && rule.rulesPackId !== filters.rulesPackId) return false;
+      if (filters.region && rule.region !== filters.region) return false;
+      if (filters.industry) {
+        const pack = this.data.rulesPacks.find((item) => item.rulesPackId === rule.rulesPackId);
+        if (pack?.industry !== filters.industry) return false;
+      }
       return true;
     });
   }
 
   async saveApplicableRules(organizationId, facilityId, rulesPackId, rules) {
+    const facility = await this.getFacility(organizationId, facilityId);
+    if (rules.some((rule) => rule.rulesPackId !== rulesPackId)) throw forbidden("Applicable rule does not belong to the selected rules pack");
+    facility.selectedRulesPackId = rulesPackId;
+    facility.updatedAt = nowIso();
     this.data.facilityApplicableRules = this.data.facilityApplicableRules.filter((row) => row.organizationId !== organizationId || row.facilityId !== facilityId);
     for (const rule of rules) {
       this.data.facilityApplicableRules.push({
@@ -191,6 +273,13 @@ export class FileRepository {
   }
 
   async createReview(input) {
+    const facility = await this.getFacility(input.organizationId, input.facilityId);
+    if (facility.country !== input.country || facility.region !== input.region) {
+      throw forbidden("Review jurisdiction does not match the facility jurisdiction");
+    }
+    if (facility.selectedRulesPackId && facility.selectedRulesPackId !== input.rulesPackId) {
+      throw forbidden("Review rules pack does not match the facility rules pack");
+    }
     const reviewId = input.id || this.createId();
     const review = {
       id: reviewId,
@@ -255,6 +344,10 @@ export class FileRepository {
   }
 
   async createAuditPacket(input) {
+    const facility = await this.getFacility(input.organizationId, input.facilityId);
+    const review = await this.getReview(input.organizationId, input.reviewId);
+    if (review.facilityId !== facility.id) throw forbidden("Review does not belong to this facility");
+    if (input.rulesPackId !== review.rulesPackId) throw forbidden("Packet rules pack does not match the review rules pack");
     const row = { id: input.id || this.createId(), generatedAt: nowIso(), ...input };
     this.data.auditPackets.push(row);
     await this.persist();
@@ -270,6 +363,11 @@ export class FileRepository {
   }
 
   async createExpertReview(input) {
+    if (input.facilityId) await this.getFacility(input.organizationId, input.facilityId);
+    if (input.reviewId) {
+      const review = await this.getReview(input.organizationId, input.reviewId);
+      if (input.facilityId && review.facilityId !== input.facilityId) throw forbidden("Review does not belong to this facility");
+    }
     const row = { id: input.id || this.createId(), status: input.status || "requested", createdAt: nowIso(), updatedAt: nowIso(), ...input };
     this.data.expertReviews.push(row);
     await this.persist();

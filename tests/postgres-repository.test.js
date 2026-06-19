@@ -2,16 +2,16 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { PostgresRepository } from "../packages/db/src/postgres-repository.js";
-import { loadInitialMigrationSql } from "../packages/db/src/repository.js";
+import { runMigrations } from "../packages/db/src/migration-runner.js";
+import { createPostgresPool } from "../packages/db/src/postgres-pool.js";
+import { loadMigrations } from "../packages/db/src/repository.js";
 import { parseEvidenceInput, parseFacilityInput } from "../packages/shared/src/index.js";
 import { generateReview } from "../packages/rules/src/index.js";
 
 test("postgres repository persists facilities, evidence, reviews, matches, and packets", { skip: !process.env.TEST_DATABASE_URL }, async () => {
-  const pg = await import("pg");
-  const Pool = pg.default?.Pool || pg.Pool;
-  const pool = new Pool({ connectionString: process.env.TEST_DATABASE_URL });
+  const pool = await createPostgresPool(process.env.TEST_DATABASE_URL);
   try {
-    await pool.query(await loadInitialMigrationSql());
+    await runMigrations(pool, await loadMigrations());
   } finally {
     await pool.end();
   }
@@ -39,6 +39,19 @@ test("postgres repository persists facilities, evidence, reviews, matches, and p
       status: "accepted"
     }, org.id, user.id));
     const generated = generateReview({ facility, evidence: [evidence], now: new Date("2026-06-18T12:00:00Z") });
+    await repo.saveApplicableRules(org.id, facility.id, generated.rulesPack.rulesPackId, generated.applicableRules);
+    await repo.upsertAiAnalysis({
+      organizationId: org.id, facilityId: facility.id, evidenceId: evidence.id, reviewId: null,
+      processingStatus: "processed", textExtractionStatus: "extracted", detectedEvidenceType: "loto_procedures",
+      detectedTitle: "LOTO procedure", extractedDocumentDate: "2026-01-01", extractedExpirationDate: null,
+      extractedFacilityName: null, extractedEmployeeNames: [], extractedEquipmentNames: [], extractedChemicalNames: [],
+      extractedSignaturePresent: null, extractedAuthorityMentions: [], extractedCitationMentions: [], summary: "LOTO evidence",
+      issues: [], suggestedRuleId: "us-loto-procedures", suggestedObligationTitle: "Lockout/Tagout written procedures",
+      matchReason: "Type agreement", missingFieldsOrIssues: [], confidence: 0.9, needsHumanReview: false,
+      provider: "mock", model: "mock-evidence-v1", promptVersion: "evidence-intelligence-v1",
+      rawModelOutputReference: null, error: null, humanReviewed: false, humanAcceptedAiResult: false,
+      humanReviewerId: null, humanReviewedAt: null, humanOverrideEvidenceType: null, humanOverrideRuleId: null, humanReviewNotes: null
+    });
     const review = await repo.createReview({
       organizationId: org.id,
       facilityId: facility.id,
@@ -66,16 +79,25 @@ test("postgres repository persists facilities, evidence, reviews, matches, and p
       rulesPackId: generated.rulesPack.rulesPackId,
       status: "generated"
     });
+    await repo.logAudit({ organizationId: org.id, facilityId: facility.id, actorUserId: user.id, action: "packet.exported", entityType: "audit_packet", entityId: packet.id });
 
     await repo.close();
     const restarted = new PostgresRepository(process.env.TEST_DATABASE_URL);
     await restarted.init();
     try {
-      assert.equal((await restarted.getFacility(org.id, facility.id)).id, facility.id);
+      const persistedFacility = await restarted.getFacility(org.id, facility.id);
+      assert.equal(persistedFacility.id, facility.id);
+      assert.equal(persistedFacility.selectedRulesPackId, generated.rulesPack.rulesPackId);
       assert.equal((await restarted.listEvidence(org.id, facility.id))[0].id, evidence.id);
-      assert.equal((await restarted.getReview(org.id, review.id)).readinessScore, generated.readinessScore);
+      const persistedReview = await restarted.getReview(org.id, review.id);
+      assert.equal(persistedReview.readinessScore, generated.readinessScore);
+      assert.deepEqual(persistedReview.scoreExplanation, generated.scoreExplanation);
+      assert.equal((await restarted.getGapRows(org.id, review.id)).length, generated.gapRows.length);
+      assert.equal((await restarted.getActionItems(org.id, review.id)).length, generated.actionPlan.length);
       assert.ok((await restarted.getEvidenceMatches(org.id, facility.id)).some((match) => match.evidenceId === evidence.id));
+      assert.equal((await restarted.getAiAnalysis(org.id, evidence.id)).detectedEvidenceType, "loto_procedures");
       assert.equal((await restarted.listAuditPackets(org.id, facility.id))[0].id, packet.id);
+      assert.ok((await restarted.listAuditLogs(org.id, facility.id)).some((entry) => entry.action === "packet.exported"));
     } finally {
       await restarted.close();
     }

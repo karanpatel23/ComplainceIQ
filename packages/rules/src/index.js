@@ -122,18 +122,37 @@ export function getApplicableRules(facility) {
   return { rulesPack: pack, rules };
 }
 
-export function buildEvidenceMatches(rules, evidence, now = new Date()) {
+export function buildEvidenceMatches(rules, evidence, now = new Date(), aiAnalyses = []) {
   const matches = [];
   for (const ruleItem of rules) {
     for (const evidenceItem of evidence.filter((item) => !item.archived)) {
-      const typeMatch = ruleItem.requiredEvidenceTypes.includes(evidenceItem.evidenceType);
-      const explicitMatch = evidenceItem.relatedObligationId === ruleItem.id;
-      if (typeMatch || explicitMatch) {
+      const analysis = aiAnalyses.find((item) => item.evidenceId === evidenceItem.id) || null;
+      const effectiveEvidenceType = analysis?.humanOverrideEvidenceType || evidenceItem.evidenceType;
+      const humanRuleId = analysis?.humanOverrideRuleId || null;
+      const manualRuleId = evidenceItem.relatedObligationId || null;
+      const deterministicMatch = ruleItem.requiredEvidenceTypes.includes(effectiveEvidenceType);
+      const reviewedAiMatch = Boolean(analysis?.humanReviewed && analysis?.suggestedRuleId === ruleItem.id);
+      let matchType = null;
+
+      if (humanRuleId) {
+        if (humanRuleId === ruleItem.id) matchType = "human_reviewed";
+      } else if (manualRuleId) {
+        if (manualRuleId === ruleItem.id) matchType = "manual";
+      } else if (deterministicMatch) {
+        const aiAgrees = analysis?.detectedEvidenceType === effectiveEvidenceType && analysis?.suggestedRuleId === ruleItem.id;
+        matchType = aiAgrees ? "ai_assisted_deterministic" : "deterministic";
+      } else if (reviewedAiMatch) {
+        matchType = "human_reviewed";
+      }
+
+      if (matchType) {
         matches.push({
           ruleId: ruleItem.id,
           evidenceId: evidenceItem.id,
-          matchType: explicitMatch ? "manual" : "evidence_type",
-          confidence: evidenceItem.confidence || "medium",
+          matchType,
+          confidence: analysis?.confidence === undefined || analysis?.confidence === null
+            ? evidenceItem.confidence || "medium"
+            : confidenceLabel(analysis.confidence),
           expired: isExpired(evidenceItem, now)
         });
       }
@@ -142,9 +161,10 @@ export function buildEvidenceMatches(rules, evidence, now = new Date()) {
   return matches;
 }
 
-export function buildGapMatrix(facility, rules, evidence, rulesPack, now = new Date(), evidenceMatches = buildEvidenceMatches(rules, evidence, now)) {
+export function buildGapMatrix(facility, rules, evidence, rulesPack, now = new Date(), evidenceMatches = null, aiAnalyses = []) {
+  const resolvedMatches = evidenceMatches || buildEvidenceMatches(rules, evidence, now, aiAnalyses);
   return rules.map((ruleItem) => {
-    const relatedMatches = evidenceMatches.filter((match) => match.ruleId === ruleItem.id);
+    const relatedMatches = resolvedMatches.filter((match) => match.ruleId === ruleItem.id);
     const matchedEvidence = relatedMatches
       .map((match) => evidence.find((item) => item.id === match.evidenceId))
       .filter(Boolean);
@@ -152,7 +172,7 @@ export function buildGapMatrix(facility, rules, evidence, rulesPack, now = new D
     const acceptedTypes = new Set(
       matchedEvidence
         .filter((item) => item.status === "accepted" && !isExpired(item, now))
-        .map((item) => item.evidenceType)
+        .map((item) => effectiveEvidenceType(item, aiAnalyses))
     );
     const expiredCount = matchedEvidence.filter((item) => isExpired(item, now)).length;
     const rejectedCount = matchedEvidence.filter((item) => item.status === "rejected").length;
@@ -189,9 +209,11 @@ export function buildGapMatrix(facility, rules, evidence, rulesPack, now = new D
       matchedEvidence: matchedEvidence.map((item) => ({
         id: item.id,
         title: item.title,
-        evidenceType: item.evidenceType,
-        status: isExpired(item, now) ? "expired" : item.status
+        evidenceType: effectiveEvidenceType(item, aiAnalyses),
+        status: isExpired(item, now) ? "expired" : item.status,
+        matchSource: relatedMatches.find((match) => match.evidenceId === item.id)?.matchType || "deterministic"
       })),
+      aiInsights: buildAiInsights(ruleItem, relatedMatches, aiAnalyses),
       status,
       priority: ruleItem.priority,
       confidence: confidenceForRow(ruleItem, matchedEvidence),
@@ -204,6 +226,35 @@ export function buildGapMatrix(facility, rules, evidence, rulesPack, now = new D
       rejectedEvidenceCount: rejectedCount
     };
   });
+}
+
+function buildAiInsights(ruleItem, relatedMatches, aiAnalyses) {
+  const matchedIds = new Set(relatedMatches.map((match) => match.evidenceId));
+  return aiAnalyses
+    .filter((analysis) => matchedIds.has(analysis.evidenceId) || analysis.suggestedRuleId === ruleItem.id || analysis.humanOverrideRuleId === ruleItem.id)
+    .map((analysis) => ({
+      evidenceId: analysis.evidenceId,
+      processingStatus: analysis.processingStatus,
+      detectedEvidenceType: analysis.detectedEvidenceType,
+      confidence: analysis.confidence,
+      needsHumanReview: analysis.needsHumanReview,
+      humanReviewed: analysis.humanReviewed,
+      matchReason: analysis.matchReason,
+      issues: analysis.issues || [],
+      extractedDocumentDate: analysis.extractedDocumentDate,
+      extractedExpirationDate: analysis.extractedExpirationDate,
+      matchSource: relatedMatches.find((match) => match.evidenceId === analysis.evidenceId)?.matchType || "ai_suggestion"
+    }));
+}
+
+function effectiveEvidenceType(evidenceItem, aiAnalyses) {
+  return aiAnalyses.find((analysis) => analysis.evidenceId === evidenceItem.id)?.humanOverrideEvidenceType || evidenceItem.evidenceType;
+}
+
+function confidenceLabel(confidence) {
+  if (confidence >= 0.8) return "high";
+  if (confidence >= 0.7) return "medium";
+  return "low";
 }
 
 function confidenceForRow(ruleItem, matchedEvidence) {
@@ -288,13 +339,13 @@ export function generateActionPlan(gapRows) {
     });
 }
 
-export function generateReview({ facility, evidence, now = new Date() }) {
+export function generateReview({ facility, evidence, aiAnalyses = [], now = new Date() }) {
   const { rulesPack, rules } = getApplicableRules(facility);
   if (!rulesPack) {
     throw new Error(`No rules pack available for country ${facility.country}`);
   }
-  const evidenceMatches = buildEvidenceMatches(rules, evidence, now);
-  const gapRows = buildGapMatrix(facility, rules, evidence, rulesPack, now, evidenceMatches);
+  const evidenceMatches = buildEvidenceMatches(rules, evidence, now, aiAnalyses);
+  const gapRows = buildGapMatrix(facility, rules, evidence, rulesPack, now, evidenceMatches, aiAnalyses);
   const score = computeReadinessScore(gapRows);
   const actionPlan = generateActionPlan(gapRows);
   const acceptedEvidenceCount = evidence.filter((item) => item.status === "accepted" && !isExpired(item, now)).length;
@@ -332,7 +383,8 @@ export function generateReview({ facility, evidence, now = new Date() }) {
       acceptedEvidenceCount,
       totalApplicableObligations: gapRows.length,
       demoRulesCount: gapRows.filter((row) => row.demoContent).length,
-      expertReviewedRulesCount: gapRows.filter((row) => row.expertReviewed).length
+      expertReviewedRulesCount: gapRows.filter((row) => row.expertReviewed).length,
+      aiNeedsReviewCount: aiAnalyses.filter((analysis) => analysis.needsHumanReview && !analysis.humanReviewed).length
     }
   };
 }

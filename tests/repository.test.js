@@ -36,6 +36,7 @@ test("file repository persists facilities, evidence, and reviews after reinitial
     status: "accepted"
   }, org.id, user.id));
   const generated = generateReview({ facility, evidence: [evidence], now: new Date("2026-06-18T12:00:00Z") });
+  await repo.saveApplicableRules(org.id, facility.id, generated.rulesPack.rulesPackId, generated.applicableRules);
   const review = await repo.createReview({
     organizationId: org.id,
     facilityId: facility.id,
@@ -66,12 +67,42 @@ test("file repository persists facilities, evidence, and reviews after reinitial
 
   const restarted = await repoAt(file);
   assert.equal((await restarted.listFacilities(org.id))[0].id, facility.id);
+  assert.equal((await restarted.getFacility(org.id, facility.id)).selectedRulesPackId, generated.rulesPack.rulesPackId);
   assert.equal((await restarted.listEvidence(org.id, facility.id))[0].id, evidence.id);
   assert.equal((await restarted.getReview(org.id, review.id)).readinessScore, generated.readinessScore);
   assert.equal((await restarted.getGapRows(org.id, review.id)).length, generated.gapRows.length);
   assert.ok((await restarted.getActionItems(org.id, review.id)).length > 0);
   assert.ok((await restarted.getEvidenceMatches(org.id, facility.id)).some((match) => match.evidenceId === evidence.id));
   assert.equal((await restarted.listAuditPackets(org.id, facility.id))[0].id, packet.id);
+});
+
+test("file repository persists sessions and rejects tenant-mismatched writes", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "ciq-session-"));
+  const file = path.join(dir, "db.json");
+  const repo = await repoAt(file);
+  const orgA = await repo.createOrganization({ name: "Tenant A" });
+  const orgB = await repo.createOrganization({ name: "Tenant B" });
+  const user = await repo.createUser({ organizationId: orgA.id, email: "session@example.com", passwordHash: "hash", name: "A", role: "admin", isActive: true });
+  const facility = await repo.createFacility(parseFacilityInput({
+    name: "Plant A",
+    country: "US",
+    stateProvince: "OH",
+    region: "OH",
+    industry: "industrial_manufacturing",
+    facilityType: "fabrication",
+    employeeCount: 20,
+    hazardProfile: { machinery: true }
+  }, orgA.id));
+  const session = await repo.createSession({ organizationId: orgA.id, userId: user.id, expiresAt: "2030-01-01T00:00:00.000Z" });
+
+  const restarted = await repoAt(file);
+  assert.equal((await restarted.getSession(session.id)).userId, user.id);
+  await assert.rejects(() => restarted.createSession({ organizationId: orgB.id, userId: user.id, expiresAt: "2030-01-01T00:00:00.000Z" }), /does not belong/);
+  await assert.rejects(() => restarted.createEvidence(parseEvidenceInput({
+    facilityId: facility.id,
+    title: "Cross-tenant evidence",
+    evidenceType: "loto_procedures"
+  }, orgB.id, user.id)), /another organization/);
 });
 
 test("repository blocks cross-organization access", async () => {

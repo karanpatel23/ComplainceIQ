@@ -2,20 +2,29 @@ import http from "node:http";
 import { URL } from "node:url";
 import { readConfig } from "../../../packages/config/src/index.js";
 import { createRepository } from "../../../packages/db/src/repository.js";
-import { parseEvidenceInput, parseFacilityInput, toPublicUser, jsonError, unauthorized, validationError } from "../../../packages/shared/src/index.js";
+import { createEvidenceAiProvider, parseAiReviewInput } from "../../../packages/ai/src/index.js";
+import { EVIDENCE_TAXONOMY, forbidden, parseEvidenceInput, parseFacilityInput, toPublicUser, jsonError, unauthorized, validationError } from "../../../packages/shared/src/index.js";
 import { getApplicableRules, generateReview, RULES_PACKS, COMPLIANCE_RULES } from "../../../packages/rules/src/index.js";
 import { generateAuditPacketPdf } from "../../../packages/pdf/src/index.js";
-import { LocalPrivateStorage } from "./storage.js";
+import { createPrivateStorage } from "./storage.js";
 import { signSessionId, verifyPassword, verifySignedSession } from "./security.js";
+import { createEvidenceAiService } from "./evidence-ai-service.js";
 
 const config = readConfig(process.env);
 const repo = await createRepository(config);
-const storage = new LocalPrivateStorage(config);
+const storage = createPrivateStorage(config);
+const aiProvider = createEvidenceAiProvider(config);
+const evidenceAiService = createEvidenceAiService({ config, repo, storage, provider: aiProvider });
+const DEFAULT_JSON_LIMIT_BYTES = 1024 * 1024;
+const UPLOAD_JSON_LIMIT_BYTES = Math.ceil(config.maxUploadMb * 1024 * 1024 * 4 / 3) + 256 * 1024;
 
 const server = http.createServer(async (req, res) => {
   try {
     await handleRequest(req, res);
   } catch (error) {
+    if (!error.status || error.status >= 500) {
+      process.stderr.write(`[ComplianceIQ API] ${error.stack || error.message}\n`);
+    }
     sendJson(res, jsonError(error));
   }
 });
@@ -27,13 +36,15 @@ async function handleRequest(req, res) {
     res.end();
     return;
   }
+  enforceTrustedOrigin(req);
 
   const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
   const path = url.pathname.replace(/\/$/, "") || "/";
   const method = req.method || "GET";
 
   if (method === "GET" && path === "/api/health") {
-    return sendJson(res, { status: 200, body: { ok: true, service: "ComplianceIQ API", persistence: config.repositoryBackend } });
+    const persistence = await repo.healthCheck();
+    return sendJson(res, { status: 200, body: { ok: true, service: "ComplianceIQ API", persistence } });
   }
 
   if (method === "POST" && path === "/api/auth/login") return login(req, res);
@@ -42,6 +53,8 @@ async function handleRequest(req, res) {
   const user = await requireSession(req);
 
   if (method === "GET" && path === "/api/auth/me") return sendJson(res, { status: 200, body: toPublicUser(user) });
+  if (method === "GET" && path === "/api/ai/status") return sendJson(res, { status: 200, body: { enabled: config.aiEnabled, provider: aiProvider.kind, model: aiProvider.model || null } });
+  if (method === "GET" && path === "/api/evidence-taxonomy") return sendJson(res, { status: 200, body: EVIDENCE_TAXONOMY });
   if (method === "GET" && path === "/api/organization") return currentOrganization(res, user);
   if (method === "GET" && path === "/api/users") return listUsers(res, user);
 
@@ -53,6 +66,7 @@ async function handleRequest(req, res) {
   if (match(path, "/api/facilities/:id/applicable-rules") && method === "GET") return applicableRules(res, user, params(path).id);
 
   if (path === "/api/rules-packs" && method === "GET") return sendJson(res, { status: 200, body: await repo.listRulesPacks() });
+  if (match(path, "/api/rules-packs/:id") && method === "GET") return getRulesPack(res, params(path).id);
   if (path === "/api/rules" && method === "GET") return sendJson(res, { status: 200, body: await repo.listComplianceRules(Object.fromEntries(url.searchParams)) });
 
   if (path === "/api/evidence" && method === "GET") return listEvidence(res, user, url.searchParams.get("facilityId"));
@@ -62,6 +76,10 @@ async function handleRequest(req, res) {
   if (match(path, "/api/evidence/:id") && method === "PATCH") return updateEvidence(req, res, user, params(path).id);
   if (match(path, "/api/evidence/:id") && method === "DELETE") return archiveEvidence(res, user, params(path).id);
   if (match(path, "/api/evidence/:id/download") && method === "GET") return downloadEvidence(res, user, params(path).id);
+  if (match(path, "/api/evidence/:id/process-ai") && method === "POST") return processEvidenceAi(res, user, params(path).id);
+  if (match(path, "/api/evidence/:id/ai-analysis") && method === "GET") return getEvidenceAiAnalysis(res, user, params(path).id);
+  if (match(path, "/api/evidence/:id/ai-review") && method === "PATCH") return reviewEvidenceAi(req, res, user, params(path).id);
+  if (path === "/api/evidence-ai-analyses" && method === "GET") return listEvidenceAiAnalyses(res, user, url.searchParams.get("facilityId"));
 
   if (path === "/api/audit-readiness/reviews" && method === "GET") return listReviews(res, user, url.searchParams.get("facilityId"));
   if (path === "/api/audit-readiness/reviews" && method === "POST") return createReview(req, res, user);
@@ -81,7 +99,7 @@ async function handleRequest(req, res) {
   if (path === "/api/expert-reviews" && method === "POST") return requestExpertReview(req, res, user);
   if (match(path, "/api/expert-reviews/:id") && method === "PATCH") return updateExpertReview(req, res, user, params(path).id);
 
-  if (path === "/api/audit-logs" && method === "GET") return sendJson(res, { status: 200, body: await repo.listAuditLogs(user.organizationId, url.searchParams.get("facilityId")) });
+  if (path === "/api/audit-logs" && method === "GET") return listAuditLogs(res, user, url.searchParams.get("facilityId"));
 
   const error = new Error("Route not found");
   error.status = 404;
@@ -120,7 +138,7 @@ async function requireSession(req) {
   const session = await repo.getSession(sessionId);
   if (!session) throw unauthorized();
   const user = await repo.findUserById(session.userId);
-  if (!user || !user.isActive) throw unauthorized();
+  if (!user || !user.isActive || user.organizationId !== session.organizationId) throw unauthorized();
   return user;
 }
 
@@ -149,8 +167,9 @@ async function createFacility(req, res, user) {
   const facility = await repo.createFacility(input);
   const { rulesPack, rules } = getApplicableRules(facility);
   if (rulesPack) await repo.saveApplicableRules(user.organizationId, facility.id, rulesPack.rulesPackId, rules);
+  const persistedFacility = await repo.getFacility(user.organizationId, facility.id);
   await audit(user, facility.id, "facility.created", "facility", facility.id, { name: facility.name });
-  sendJson(res, { status: 201, body: { ...facility, rulesPack, applicableRuleCount: rules.length } });
+  sendJson(res, { status: 201, body: { ...persistedFacility, rulesPack, applicableRuleCount: rules.length } });
 }
 
 async function getFacility(res, user, id) {
@@ -164,8 +183,19 @@ async function updateFacility(req, res, user, id) {
   const facility = await repo.updateFacility(user.organizationId, id, updates);
   const { rulesPack, rules } = getApplicableRules(facility);
   if (rulesPack) await repo.saveApplicableRules(user.organizationId, facility.id, rulesPack.rulesPackId, rules);
+  const persistedFacility = await repo.getFacility(user.organizationId, facility.id);
   await audit(user, facility.id, "facility.updated", "facility", facility.id, {});
-  sendJson(res, { status: 200, body: { ...facility, rulesPack, applicableRuleCount: rules.length } });
+  sendJson(res, { status: 200, body: { ...persistedFacility, rulesPack, applicableRuleCount: rules.length } });
+}
+
+async function getRulesPack(res, rulesPackId) {
+  const rulesPack = await repo.getRulesPack(rulesPackId);
+  if (!rulesPack) {
+    const error = new Error("Rules pack not found");
+    error.status = 404;
+    throw error;
+  }
+  sendJson(res, { status: 200, body: rulesPack });
 }
 
 async function archiveFacility(res, user, id) {
@@ -187,16 +217,52 @@ async function listEvidence(res, user, facilityId) {
 }
 
 async function createEvidence(req, res, user, allowsFile) {
-  const body = await readJson(req);
+  const body = await readJson(req, allowsFile ? UPLOAD_JSON_LIMIT_BYTES : DEFAULT_JSON_LIMIT_BYTES);
+  if (["accepted", "rejected"].includes(body.status)) requireRole(user, ["admin", "reviewer"]);
   const facility = await requireFacility(user.organizationId, body.facilityId);
   let fileReference = null;
-  if (allowsFile && body.contentBase64) {
-    const saved = await storage.saveBuffer(Buffer.from(String(body.contentBase64), "base64"), body.fileName || "evidence.bin");
+  let fileMetadata = { fileName: null, contentType: null, fileSizeBytes: null, fileSha256: null };
+  if (allowsFile) {
+    if (!body.contentBase64) throw validationError("contentBase64 is required for evidence upload");
+    const buffer = decodeBase64(body.contentBase64);
+    const fileName = safeOriginalFileName(body.fileName || "evidence.bin");
+    const saved = await storage.saveBuffer(buffer, fileName);
     fileReference = saved.fileReference;
+    fileMetadata = {
+      fileName,
+      contentType: normalizeContentType(body.contentType),
+      fileSizeBytes: buffer.byteLength,
+      fileSha256: saved.sha256
+    };
   }
-  const evidence = await repo.createEvidence(parseEvidenceInput({ ...body, fileReference, country: facility.country, region: facility.region }, user.organizationId, user.id));
-  await audit(user, facility.id, "evidence.created", "evidence", evidence.id, { evidenceType: evidence.evidenceType });
-  sendJson(res, { status: 201, body: evidence });
+  let evidence;
+  try {
+    evidence = await repo.createEvidence(parseEvidenceInput({
+      ...body,
+      fileReference,
+      ...fileMetadata,
+      country: facility.country,
+      region: facility.region
+    }, user.organizationId, user.id));
+  } catch (error) {
+    if (fileReference) await storage.deleteBuffer(fileReference);
+    throw error;
+  }
+  await audit(user, facility.id, allowsFile ? "evidence_uploaded" : "evidence.created", "evidence", evidence.id, { evidenceType: evidence.evidenceType, hasFile: allowsFile });
+  let aiAnalysis = null;
+  let aiProcessingError = null;
+  let aiReview = null;
+  if (allowsFile) {
+    try {
+      aiAnalysis = await evidenceAiService.processEvidence({ organizationId: user.organizationId, evidenceId: evidence.id, userId: user.id });
+      evidence = await repo.getEvidence(user.organizationId, evidence.id);
+      aiReview = await generateAndPersistReview(user, facility);
+    } catch (error) {
+      aiAnalysis = await repo.getAiAnalysis(user.organizationId, evidence.id);
+      aiProcessingError = String(error.message || "AI evidence processing failed");
+    }
+  }
+  sendJson(res, { status: 201, body: { ...evidence, aiAnalysis, aiProcessingError, aiReview } });
 }
 
 async function getEvidence(res, user, id) {
@@ -207,7 +273,19 @@ async function getEvidence(res, user, id) {
 async function updateEvidence(req, res, user, id) {
   const existing = await requireEvidence(user.organizationId, id);
   const body = await readJson(req);
-  const updates = parseEvidenceInput({ ...existing, ...body, fileReference: existing.fileReference, facilityId: existing.facilityId, country: existing.country, region: existing.region }, user.organizationId, user.id);
+  if (["accepted", "rejected"].includes(body.status) && body.status !== existing.status) requireRole(user, ["admin", "reviewer"]);
+  const updates = parseEvidenceInput({
+    ...existing,
+    ...body,
+    fileReference: existing.fileReference,
+    fileName: existing.fileName,
+    contentType: existing.contentType,
+    fileSizeBytes: existing.fileSizeBytes,
+    fileSha256: existing.fileSha256,
+    facilityId: existing.facilityId,
+    country: existing.country,
+    region: existing.region
+  }, user.organizationId, user.id);
   const evidence = await repo.updateEvidence(user.organizationId, id, updates);
   await audit(user, evidence.facilityId, "evidence.updated", "evidence", evidence.id, { status: evidence.status });
   sendJson(res, { status: 200, body: evidence });
@@ -228,14 +306,20 @@ async function downloadEvidence(res, user, id) {
   }
   const buffer = await storage.readBuffer(evidence.fileReference);
   await audit(user, evidence.facilityId, "evidence.downloaded", "evidence", evidence.id, {});
-  sendBuffer(res, buffer, "application/octet-stream", `${safeDownloadName(evidence.title)}.bin`);
+  sendBuffer(res, buffer, evidence.contentType || "application/octet-stream", evidence.fileName || `${safeDownloadName(evidence.title)}.bin`);
 }
 
 async function createReview(req, res, user) {
   const body = await readJson(req);
   const facility = await requireFacility(user.organizationId, body.facilityId);
+  const generated = await generateAndPersistReview(user, facility);
+  sendJson(res, { status: 201, body: generated });
+}
+
+async function generateAndPersistReview(user, facility) {
   const evidence = await repo.listEvidence(user.organizationId, facility.id);
-  const generated = generateReview({ facility, evidence });
+  const aiAnalyses = await repo.listAiAnalyses(user.organizationId, facility.id);
+  const generated = generateReview({ facility, evidence, aiAnalyses });
   await repo.saveApplicableRules(user.organizationId, facility.id, generated.rulesPack.rulesPackId, generated.applicableRules);
   const review = await repo.createReview({
     organizationId: user.organizationId,
@@ -253,7 +337,46 @@ async function createReview(req, res, user) {
     actionPlan: generated.actionPlan
   });
   await audit(user, facility.id, "review.generated", "audit_readiness_review", review.id, { readinessScore: review.readinessScore });
-  sendJson(res, { status: 201, body: { review, gapRows: generated.gapRows, actionPlan: generated.actionPlan, rulesPack: generated.rulesPack } });
+  return { review, gapRows: generated.gapRows, actionPlan: generated.actionPlan, rulesPack: generated.rulesPack };
+}
+
+async function processEvidenceAi(res, user, evidenceId) {
+  await requireEvidence(user.organizationId, evidenceId);
+  const analysis = await evidenceAiService.processEvidence({ organizationId: user.organizationId, evidenceId, userId: user.id });
+  const facility = await requireFacility(user.organizationId, analysis.facilityId);
+  const generated = await generateAndPersistReview(user, facility);
+  sendJson(res, { status: 200, body: { analysis, ...generated } });
+}
+
+async function getEvidenceAiAnalysis(res, user, evidenceId) {
+  await requireEvidence(user.organizationId, evidenceId);
+  const analysis = await repo.getAiAnalysis(user.organizationId, evidenceId);
+  if (!analysis) {
+    const error = new Error("AI analysis not found");
+    error.status = 404;
+    throw error;
+  }
+  sendJson(res, { status: 200, body: analysis });
+}
+
+async function listEvidenceAiAnalyses(res, user, facilityId) {
+  if (!facilityId) throw validationError("facilityId query parameter is required");
+  await requireFacility(user.organizationId, facilityId);
+  sendJson(res, { status: 200, body: await repo.listAiAnalyses(user.organizationId, facilityId) });
+}
+
+async function reviewEvidenceAi(req, res, user, evidenceId) {
+  requireRole(user, ["admin", "reviewer"]);
+  const reviewInput = parseAiReviewInput(await readJson(req));
+  const reviewed = await evidenceAiService.reviewEvidence({ organizationId: user.organizationId, evidenceId, reviewer: user, reviewInput });
+  if (!reviewed) {
+    const error = new Error("AI analysis not found");
+    error.status = 404;
+    throw error;
+  }
+  const facility = await requireFacility(user.organizationId, reviewed.evidence.facilityId);
+  const generated = await generateAndPersistReview(user, facility);
+  sendJson(res, { status: 200, body: { ...reviewed, ...generated } });
 }
 
 async function listReviews(res, user, facilityId) {
@@ -274,23 +397,30 @@ async function exportPacket(req, res, user) {
   const gapRows = await repo.getGapRows(user.organizationId, review.id);
   const actionItems = await repo.getActionItems(user.organizationId, review.id);
   const findings = await repo.getFindings(user.organizationId, review.id);
-  const rulesPack = RULES_PACKS.find((pack) => pack.rulesPackId === review.rulesPackId);
-  const pdf = generateAuditPacketPdf({ facility, review, gapRows, actionItems, evidence, rulesPack, findings });
+  const aiAnalyses = await repo.listAiAnalyses(user.organizationId, facility.id);
+  const rulesPack = await repo.getRulesPack(review.rulesPackId) || RULES_PACKS.find((pack) => pack.rulesPackId === review.rulesPackId);
+  const pdf = generateAuditPacketPdf({ facility, review, gapRows, actionItems, evidence, rulesPack, findings, aiAnalyses });
   const title = "Industrial Audit Readiness Packet";
   const saved = await storage.saveBuffer(pdf, `audit-packet-${facility.name}.pdf`);
-  const packet = await repo.createAuditPacket({
-    organizationId: user.organizationId,
-    facilityId: facility.id,
-    reviewId: review.id,
-    title,
-    fileReference: saved.fileReference,
-    generatedByUserId: user.id,
-    country: facility.country,
-    region: facility.region,
-    rulesPackId: review.rulesPackId,
-    status: "generated"
-  });
-  await audit(user, facility.id, "packet.exported", "audit_packet", packet.id, { reviewId: review.id });
+  let packet;
+  try {
+    packet = await repo.createAuditPacket({
+      organizationId: user.organizationId,
+      facilityId: facility.id,
+      reviewId: review.id,
+      title,
+      fileReference: saved.fileReference,
+      generatedByUserId: user.id,
+      country: facility.country,
+      region: facility.region,
+      rulesPackId: review.rulesPackId,
+      status: "generated"
+    });
+  } catch (error) {
+    await storage.deleteBuffer(saved.fileReference);
+    throw error;
+  }
+  await audit(user, facility.id, aiAnalyses.length ? "packet_exported_with_ai_lineage" : "packet.exported", "audit_packet", packet.id, { reviewId: review.id, aiAnalysisCount: aiAnalyses.length });
   sendJson(res, { status: 201, body: { packet, downloadUrl: `/api/audit-packets/${packet.id}/download` } });
 }
 
@@ -338,6 +468,11 @@ async function updateExpertReview(req, res, user, id) {
   sendJson(res, { status: 200, body: item });
 }
 
+async function listAuditLogs(res, user, facilityId) {
+  if (facilityId) await requireFacility(user.organizationId, facilityId);
+  sendJson(res, { status: 200, body: await repo.listAuditLogs(user.organizationId, facilityId) });
+}
+
 async function requireFacility(organizationId, id) {
   const facility = await repo.getFacility(organizationId, id);
   if (!facility) {
@@ -380,10 +515,23 @@ async function audit(user, facilityId, action, entityType, entityId, metadata) {
   await repo.logAudit({ organizationId: user.organizationId, facilityId, actorUserId: user.id, action, entityType, entityId, metadata });
 }
 
-async function readJson(req) {
+async function readJson(req, maxBytes = DEFAULT_JSON_LIMIT_BYTES) {
   const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
+  let totalBytes = 0;
+  for await (const chunk of req) {
+    totalBytes += chunk.byteLength;
+    if (totalBytes > maxBytes) {
+      const error = new Error("Request body is too large");
+      error.status = 413;
+      error.code = "PAYLOAD_TOO_LARGE";
+      throw error;
+    }
+    chunks.push(chunk);
+  }
   if (chunks.length === 0) return {};
+  if (!String(req.headers["content-type"] || "").toLowerCase().startsWith("application/json")) {
+    throw validationError("Content-Type must be application/json");
+  }
   try {
     return JSON.parse(Buffer.concat(chunks).toString("utf8"));
   } catch {
@@ -432,6 +580,12 @@ function applyCors(req, res) {
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS");
 }
 
+function enforceTrustedOrigin(req) {
+  if (!["POST", "PATCH", "DELETE"].includes(req.method || "GET")) return;
+  const origin = req.headers.origin;
+  if (origin && !config.allowedOrigins.includes(origin)) throw forbidden("Origin is not allowed");
+}
+
 function match(path, pattern) {
   const a = path.split("/").filter(Boolean);
   const b = pattern.split("/").filter(Boolean);
@@ -440,7 +594,7 @@ function match(path, pattern) {
 
 function params(path) {
   const parts = path.split("/").filter(Boolean);
-  const id = parts[parts.length - 1] === "download" || parts[parts.length - 1] === "gap-matrix" || parts[parts.length - 1] === "score" || parts[parts.length - 1] === "action-plan" || parts[parts.length - 1] === "applicable-rules"
+  const id = ["download", "gap-matrix", "score", "action-plan", "applicable-rules", "process-ai", "ai-analysis", "ai-review"].includes(parts[parts.length - 1])
     ? parts[parts.length - 2]
     : parts[parts.length - 1];
   return { id };
@@ -450,10 +604,33 @@ function safeDownloadName(name) {
   return String(name || "download").replace(/[^a-z0-9_-]+/gi, "-").slice(0, 80);
 }
 
+function safeOriginalFileName(name) {
+  return String(name || "evidence.bin").split(/[\\/]/).pop().replace(/[^a-z0-9._ -]+/gi, "-").slice(0, 180) || "evidence.bin";
+}
+
+function normalizeContentType(value) {
+  const contentType = String(value || "application/octet-stream").trim().toLowerCase();
+  return /^[a-z0-9.+-]+\/[a-z0-9.+-]+$/.test(contentType) ? contentType : "application/octet-stream";
+}
+
+function decodeBase64(value) {
+  const encoded = String(value || "");
+  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) {
+    throw validationError("contentBase64 must be valid base64");
+  }
+  return Buffer.from(encoded, "base64");
+}
+
 if (process.env.NODE_ENV !== "test") {
   server.listen(config.port, config.apiHost, () => {
     process.stderr.write(`ComplianceIQ API listening on http://${config.apiHost}:${config.port}\n`);
   });
+  const shutdown = () => server.close(async () => {
+    await repo.close?.();
+    process.exit(0);
+  });
+  process.once("SIGTERM", shutdown);
+  process.once("SIGINT", shutdown);
 }
 
 export { server, repo };

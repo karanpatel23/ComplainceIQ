@@ -121,6 +121,25 @@ npm run seed:demo
 
 Production refuses to run demo seed.
 
+## Initial Production Administrator
+
+After migrations, provision the first organization administrator with the dedicated one-time command. It is separate from demo seed logic, requires a password of at least 14 characters, refuses to overwrite an existing user, and records an audit event.
+
+Set these secrets in the deployment environment rather than committing them:
+
+```bash
+PROVISION_ORGANIZATION_NAME='Example Manufacturing' \
+PROVISION_ADMIN_NAME='Operations Admin' \
+PROVISION_ADMIN_EMAIL='admin@example.com' \
+PROVISION_ADMIN_PASSWORD='replace-with-a-strong-password' \
+NODE_ENV=production \
+REPOSITORY_BACKEND=postgres \
+DATABASE_URL='postgresql://USER:PASSWORD@HOST:5432/complianceiq' \
+npm run admin:provision
+```
+
+Remove the four `PROVISION_*` values from the deployment environment after the command succeeds. Additional users should be created through an authenticated administration workflow.
+
 ## Running The App
 
 API:
@@ -253,7 +272,7 @@ Production should replace this with a private object storage adapter such as S3,
 - Run `npm install`
 - Set production environment variables
 - Run `npm run db:migrate`
-- Create the first admin user through an internal provisioning flow or explicit non-production seed
+- Provision the first administrator with `npm run admin:provision`, then remove its `PROVISION_*` secrets
 - Verify `npm test`, `npm run typecheck`, `npm run lint`, and `npm run build`
 - Configure private object storage for uploads and generated PDFs
 - Run the optional `TEST_DATABASE_URL=... npm test` Postgres integration check against disposable infrastructure
@@ -271,7 +290,6 @@ Production should replace this with a private object storage adapter such as S3,
 ## Next Recommended Sprint
 
 1. Add a production object-storage adapter.
-2. Add a first-admin provisioning command that does not rely on demo data.
-3. Add deeper integration tests against a disposable Postgres database.
-4. Expand review workflows for expert-reviewed rules without broadening the product.
-5. Improve the web app with a design-system frontend while keeping backend source-of-truth rules and scoring.
+2. Add deeper integration tests against a disposable Postgres database.
+3. Expand review workflows for expert-reviewed rules without broadening the product.
+4. Improve the web app with a design-system frontend while keeping backend source-of-truth rules and scoring.

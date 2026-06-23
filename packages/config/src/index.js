@@ -32,7 +32,7 @@ export function readConfig(env = process.env) {
     .filter(Boolean);
 
   if (isProduction) {
-    const required = ["PORT", "APP_URL", "ALLOWED_ORIGINS", "DATABASE_URL", "SESSION_SECRET", "UPLOAD_STORAGE_BACKEND", "UPLOAD_DIR", "MAX_UPLOAD_MB"];
+    const required = ["PORT", "APP_URL", "ALLOWED_ORIGINS", "DATABASE_URL", "SESSION_SECRET", "STORAGE_BACKEND", "MAX_UPLOAD_MB"];
     const missing = required.filter((name) => !env[name]);
     if (missing.length > 0) {
       throw new Error(`Missing required production environment variables: ${missing.join(", ")}`);
@@ -71,6 +71,32 @@ export function readConfig(env = process.env) {
     throw new Error("MAX_UPLOAD_MB must be a positive integer");
   }
 
+  const storageBackend = env.STORAGE_BACKEND || env.UPLOAD_STORAGE_BACKEND || "local";
+  if (!["local", "s3"].includes(storageBackend)) throw new Error("STORAGE_BACKEND must be local or s3");
+  if (isProduction && storageBackend !== "s3") throw new Error("STORAGE_BACKEND must be s3 in production");
+  if (storageBackend === "s3" && (!env.S3_BUCKET || !env.S3_REGION)) {
+    throw new Error("S3_BUCKET and S3_REGION are required when STORAGE_BACKEND=s3");
+  }
+  if (Boolean(env.S3_ACCESS_KEY_ID) !== Boolean(env.S3_SECRET_ACCESS_KEY)) {
+    throw new Error("S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY must be configured together");
+  }
+
+  const queueBackend = env.QUEUE_BACKEND || "local";
+  if (queueBackend !== "local") throw new Error("QUEUE_BACKEND currently supports local only");
+  const queueConcurrency = boundedInteger(env.QUEUE_CONCURRENCY || "1", "QUEUE_CONCURRENCY", 1, 16);
+  const queueMaxRetries = boundedInteger(env.QUEUE_MAX_RETRIES || "3", "QUEUE_MAX_RETRIES", 1, 10);
+
+  const malwareScanEnabled = env.MALWARE_SCAN_ENABLED === "true";
+  const malwareScanRequiredInProduction = env.MALWARE_SCAN_REQUIRED_IN_PRODUCTION === "true";
+  const malwareScannerProvider = env.MALWARE_SCANNER_PROVIDER || "mock";
+  if (malwareScannerProvider !== "mock") throw new Error("MALWARE_SCANNER_PROVIDER currently supports mock only");
+  if (isProduction && malwareScanEnabled && malwareScannerProvider === "mock") {
+    throw new Error("MALWARE_SCANNER_PROVIDER=mock is not allowed in production");
+  }
+  if (isProduction && malwareScanRequiredInProduction && (!malwareScanEnabled || malwareScannerProvider === "mock")) {
+    throw new Error("Production-required malware scanning needs an enabled non-mock scanner adapter");
+  }
+
   const aiEnabled = env.AI_ENABLED === "true";
   const aiProvider = env.AI_PROVIDER || "openai";
   const aiMaxFileTextChars = positiveInteger(env.AI_MAX_FILE_TEXT_CHARS || "12000", "AI_MAX_FILE_TEXT_CHARS");
@@ -99,9 +125,23 @@ export function readConfig(env = process.env) {
     databaseUrl: repositoryConfig.databaseUrl,
     repositoryBackend,
     sessionSecret: env.SESSION_SECRET || "development-only-session-secret-change-me",
-    uploadStorageBackend: env.UPLOAD_STORAGE_BACKEND || "local",
+    storageBackend,
+    uploadStorageBackend: storageBackend,
     uploadDir: env.UPLOAD_DIR || "data/private-storage",
     maxUploadMb,
+    s3Bucket: env.S3_BUCKET || "",
+    s3Region: env.S3_REGION || "",
+    s3Endpoint: env.S3_ENDPOINT || "",
+    s3AccessKeyId: env.S3_ACCESS_KEY_ID || "",
+    s3SecretAccessKey: env.S3_SECRET_ACCESS_KEY || "",
+    s3ForcePathStyle: env.S3_FORCE_PATH_STYLE === "true",
+    signedUrlExpirySeconds: boundedInteger(env.SIGNED_URL_EXPIRY_SECONDS || "300", "SIGNED_URL_EXPIRY_SECONDS", 60, 3_600),
+    queueBackend,
+    queueConcurrency,
+    queueMaxRetries,
+    malwareScanEnabled,
+    malwareScanRequiredInProduction,
+    malwareScannerProvider,
     enableDemoData: env.ENABLE_DEMO_DATA === "true",
     adminEmail: env.ADMIN_EMAIL || "admin@complianceiq.local",
     adminPassword: env.ADMIN_PASSWORD || "",
@@ -124,5 +164,11 @@ function positiveInteger(value, name) {
 function unitInterval(value, name) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) throw new Error(`${name} must be between 0 and 1`);
+  return parsed;
+}
+
+function boundedInteger(value, name, min, max) {
+  const parsed = Number.parseInt(String(value), 10);
+  if (!Number.isInteger(parsed) || parsed < min || parsed > max) throw new Error(`${name} must be an integer between ${min} and ${max}`);
   return parsed;
 }

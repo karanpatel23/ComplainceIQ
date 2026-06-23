@@ -74,3 +74,13 @@ test("score formula clamps to zero", () => {
   const score = computeReadinessScore(rows);
   assert.equal(score.readinessScore, 0);
 });
+
+test("suspicious evidence never counts as accepted", () => {
+  const result = generateReview({
+    facility: facility(),
+    evidence: [{ id: "blocked", title: "Blocked LOTO", evidenceType: "loto_procedures", status: "accepted", scanStatus: "scan_suspicious", confidence: "high" }],
+    now: new Date("2026-06-18T12:00:00Z")
+  });
+  const loto = result.gapRows.find((row) => row.ruleId === "us-loto-procedures");
+  assert.notEqual(loto.status, "accepted");
+});

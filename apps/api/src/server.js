@@ -9,12 +9,52 @@ import { generateAuditPacketPdf } from "../../../packages/pdf/src/index.js";
 import { createPrivateStorage } from "./storage.js";
 import { signSessionId, verifyPassword, verifySignedSession } from "./security.js";
 import { createEvidenceAiService } from "./evidence-ai-service.js";
+import { assertEvidenceDownloadAllowed, canProcessScannedEvidence, createMalwareScanner } from "./malware-scanner.js";
+import { createEvidenceProcessingQueue } from "./processing-queue.js";
+import { createReviewQueueService } from "./review-queue-service.js";
 
 const config = readConfig(process.env);
 const repo = await createRepository(config);
 const storage = createPrivateStorage(config);
 const aiProvider = createEvidenceAiProvider(config);
 const evidenceAiService = createEvidenceAiService({ config, repo, storage, provider: aiProvider });
+const malwareScanner = createMalwareScanner(config);
+const reviewQueueService = createReviewQueueService({ repo });
+const processingQueue = createEvidenceProcessingQueue(config, {
+  repo,
+  processor: async (job) => {
+    const evidence = await repo.getEvidence(job.organizationId, job.evidenceId);
+    if (!evidence || !canProcessScannedEvidence(evidence, config)) {
+      const error = new Error("Evidence cannot be processed until its file scan is clean");
+      error.code = "FILE_SCAN_BLOCKED";
+      error.retryable = false;
+      throw error;
+    }
+    const analysis = await evidenceAiService.processEvidence({
+      organizationId: job.organizationId,
+      evidenceId: job.evidenceId,
+      userId: job.createdByUserId,
+      processingJobId: job.id,
+      createdByType: "system"
+    });
+    const facility = await repo.getFacility(job.organizationId, job.facilityId);
+    if (facility) {
+      const actor = job.createdByUserId ? await repo.findUserById(job.createdByUserId) : null;
+      await generateAndPersistReview(actor || { id: null, organizationId: job.organizationId }, facility);
+    }
+    return analysis;
+  },
+  onEvent: async (action, job, metadata) => repo.logAudit({
+    organizationId: job.organizationId,
+    facilityId: job.facilityId,
+    actorUserId: job.createdByUserId,
+    action,
+    entityType: "evidence_processing_job",
+    entityId: job.id,
+    metadata: { evidenceId: job.evidenceId, processingAttempts: job.processingAttempts, ...metadata }
+  })
+});
+await processingQueue.start();
 const DEFAULT_JSON_LIMIT_BYTES = 1024 * 1024;
 const UPLOAD_JSON_LIMIT_BYTES = Math.ceil(config.maxUploadMb * 1024 * 1024 * 4 / 3) + 256 * 1024;
 
@@ -53,7 +93,7 @@ async function handleRequest(req, res) {
   const user = await requireSession(req);
 
   if (method === "GET" && path === "/api/auth/me") return sendJson(res, { status: 200, body: toPublicUser(user) });
-  if (method === "GET" && path === "/api/ai/status") return sendJson(res, { status: 200, body: { enabled: config.aiEnabled, provider: aiProvider.kind, model: aiProvider.model || null } });
+  if (method === "GET" && path === "/api/ai/status") return sendJson(res, { status: 200, body: { enabled: config.aiEnabled, provider: aiProvider.kind, model: aiProvider.model || null, queueBackend: config.queueBackend, storageBackend: config.storageBackend, malwareScanner: malwareScanner.kind } });
   if (method === "GET" && path === "/api/evidence-taxonomy") return sendJson(res, { status: 200, body: EVIDENCE_TAXONOMY });
   if (method === "GET" && path === "/api/organization") return currentOrganization(res, user);
   if (method === "GET" && path === "/api/users") return listUsers(res, user);
@@ -77,9 +117,13 @@ async function handleRequest(req, res) {
   if (match(path, "/api/evidence/:id") && method === "DELETE") return archiveEvidence(res, user, params(path).id);
   if (match(path, "/api/evidence/:id/download") && method === "GET") return downloadEvidence(res, user, params(path).id);
   if (match(path, "/api/evidence/:id/process-ai") && method === "POST") return processEvidenceAi(res, user, params(path).id);
+  if (match(path, "/api/evidence/:id/retry-processing") && method === "POST") return retryEvidenceProcessing(res, user, params(path).id);
   if (match(path, "/api/evidence/:id/ai-analysis") && method === "GET") return getEvidenceAiAnalysis(res, user, params(path).id);
+  if (match(path, "/api/evidence/:id/ai-analyses") && method === "GET") return getEvidenceAiHistory(res, user, params(path).id);
   if (match(path, "/api/evidence/:id/ai-review") && method === "PATCH") return reviewEvidenceAi(req, res, user, params(path).id);
   if (path === "/api/evidence-ai-analyses" && method === "GET") return listEvidenceAiAnalyses(res, user, url.searchParams.get("facilityId"));
+  if (path === "/api/evidence-processing-jobs" && method === "GET") return listEvidenceProcessingJobs(res, user, url.searchParams.get("facilityId"));
+  if (path === "/api/evidence-review-queue" && method === "GET") return listEvidenceReviewQueue(res, user, url.searchParams);
 
   if (path === "/api/audit-readiness/reviews" && method === "GET") return listReviews(res, user, url.searchParams.get("facilityId"));
   if (path === "/api/audit-readiness/reviews" && method === "POST") return createReview(req, res, user);
@@ -221,17 +265,18 @@ async function createEvidence(req, res, user, allowsFile) {
   if (["accepted", "rejected"].includes(body.status)) requireRole(user, ["admin", "reviewer"]);
   const facility = await requireFacility(user.organizationId, body.facilityId);
   let fileReference = null;
+  let uploadBuffer = null;
   let fileMetadata = { fileName: null, contentType: null, fileSizeBytes: null, fileSha256: null };
   if (allowsFile) {
     if (!body.contentBase64) throw validationError("contentBase64 is required for evidence upload");
-    const buffer = decodeBase64(body.contentBase64);
+    uploadBuffer = decodeBase64(body.contentBase64);
     const fileName = safeOriginalFileName(body.fileName || "evidence.bin");
-    const saved = await storage.saveBuffer(buffer, fileName);
+    const saved = await storage.saveBuffer(uploadBuffer, fileName);
     fileReference = saved.fileReference;
     fileMetadata = {
       fileName,
       contentType: normalizeContentType(body.contentType),
-      fileSizeBytes: buffer.byteLength,
+      fileSizeBytes: uploadBuffer.byteLength,
       fileSha256: saved.sha256
     };
   }
@@ -241,6 +286,7 @@ async function createEvidence(req, res, user, allowsFile) {
       ...body,
       fileReference,
       ...fileMetadata,
+      scanStatus: allowsFile ? "scan_pending" : "scan_unavailable",
       country: facility.country,
       region: facility.region
     }, user.organizationId, user.id));
@@ -249,20 +295,29 @@ async function createEvidence(req, res, user, allowsFile) {
     throw error;
   }
   await audit(user, facility.id, allowsFile ? "evidence_uploaded" : "evidence.created", "evidence", evidence.id, { evidenceType: evidence.evidenceType, hasFile: allowsFile });
-  let aiAnalysis = null;
-  let aiProcessingError = null;
-  let aiReview = null;
+  let processingJob = null;
   if (allowsFile) {
+    let scan;
     try {
-      aiAnalysis = await evidenceAiService.processEvidence({ organizationId: user.organizationId, evidenceId: evidence.id, userId: user.id });
-      evidence = await repo.getEvidence(user.organizationId, evidence.id);
-      aiReview = await generateAndPersistReview(user, facility);
+      scan = await malwareScanner.scanBuffer({ buffer: uploadBuffer, fileName: evidence.fileName, contentType: evidence.contentType });
     } catch (error) {
-      aiAnalysis = await repo.getAiAnalysis(user.organizationId, evidence.id);
-      aiProcessingError = String(error.message || "AI evidence processing failed");
+      scan = { status: "scan_failed", provider: malwareScanner.kind, error: String(error.message || "File scanning failed").slice(0, 500) };
+    }
+    evidence = await repo.updateEvidence(user.organizationId, evidence.id, {
+      scanStatus: scan.status,
+      scanProvider: scan.provider,
+      scanError: scan.error,
+      scannedAt: new Date().toISOString(),
+      status: scan.status === "scan_suspicious" ? "needs_review" : evidence.status
+    });
+    await audit(user, facility.id, scanEvent(scan.status), "evidence", evidence.id, { scanStatus: scan.status, provider: scan.provider });
+    if (canProcessScannedEvidence(evidence, config)) {
+      processingJob = await processingQueue.enqueue({ organizationId: user.organizationId, facilityId: facility.id, evidenceId: evidence.id, createdByUserId: user.id });
+    } else if (evidence.status === "pending") {
+      evidence = await repo.updateEvidence(user.organizationId, evidence.id, { status: "needs_review" });
     }
   }
-  sendJson(res, { status: 201, body: { ...evidence, aiAnalysis, aiProcessingError, aiReview } });
+  sendJson(res, { status: 201, body: { ...evidence, processingJob } });
 }
 
 async function getEvidence(res, user, id) {
@@ -299,6 +354,7 @@ async function archiveEvidence(res, user, id) {
 
 async function downloadEvidence(res, user, id) {
   const evidence = await requireEvidence(user.organizationId, id);
+  assertEvidenceDownloadAllowed(evidence);
   if (!evidence.fileReference) {
     const error = new Error("Evidence has no file attachment");
     error.status = 404;
@@ -341,11 +397,15 @@ async function generateAndPersistReview(user, facility) {
 }
 
 async function processEvidenceAi(res, user, evidenceId) {
-  await requireEvidence(user.organizationId, evidenceId);
-  const analysis = await evidenceAiService.processEvidence({ organizationId: user.organizationId, evidenceId, userId: user.id });
-  const facility = await requireFacility(user.organizationId, analysis.facilityId);
-  const generated = await generateAndPersistReview(user, facility);
-  sendJson(res, { status: 200, body: { analysis, ...generated } });
+  const evidence = await requireEvidence(user.organizationId, evidenceId);
+  if (!canProcessScannedEvidence(evidence, config)) throw processingBlockedError(evidence.scanStatus);
+  const job = await processingQueue.enqueue({ organizationId: user.organizationId, facilityId: evidence.facilityId, evidenceId, createdByUserId: user.id });
+  sendJson(res, { status: 202, body: { job } });
+}
+
+async function retryEvidenceProcessing(res, user, evidenceId) {
+  requireRole(user, ["admin", "reviewer"]);
+  return processEvidenceAi(res, user, evidenceId);
 }
 
 async function getEvidenceAiAnalysis(res, user, evidenceId) {
@@ -359,10 +419,32 @@ async function getEvidenceAiAnalysis(res, user, evidenceId) {
   sendJson(res, { status: 200, body: analysis });
 }
 
+async function getEvidenceAiHistory(res, user, evidenceId) {
+  await requireEvidence(user.organizationId, evidenceId);
+  sendJson(res, { status: 200, body: await repo.getAiAnalysisHistory(user.organizationId, evidenceId) });
+}
+
 async function listEvidenceAiAnalyses(res, user, facilityId) {
   if (!facilityId) throw validationError("facilityId query parameter is required");
   await requireFacility(user.organizationId, facilityId);
   sendJson(res, { status: 200, body: await repo.listAiAnalyses(user.organizationId, facilityId) });
+}
+
+async function listEvidenceProcessingJobs(res, user, facilityId) {
+  if (!facilityId) throw validationError("facilityId query parameter is required");
+  await requireFacility(user.organizationId, facilityId);
+  sendJson(res, { status: 200, body: await repo.listProcessingJobs(user.organizationId, facilityId) });
+}
+
+async function listEvidenceReviewQueue(res, user, searchParams) {
+  requireRole(user, ["admin", "reviewer"]);
+  const items = await reviewQueueService.list({
+    organizationId: user.organizationId,
+    facilityId: searchParams.get("facilityId") || null,
+    status: searchParams.get("status") || null,
+    priority: searchParams.get("priority") || null
+  });
+  sendJson(res, { status: 200, body: items });
 }
 
 async function reviewEvidenceAi(req, res, user, evidenceId) {
@@ -594,7 +676,7 @@ function match(path, pattern) {
 
 function params(path) {
   const parts = path.split("/").filter(Boolean);
-  const id = ["download", "gap-matrix", "score", "action-plan", "applicable-rules", "process-ai", "ai-analysis", "ai-review"].includes(parts[parts.length - 1])
+  const id = ["download", "gap-matrix", "score", "action-plan", "applicable-rules", "process-ai", "retry-processing", "ai-analysis", "ai-analyses", "ai-review"].includes(parts[parts.length - 1])
     ? parts[parts.length - 2]
     : parts[parts.length - 1];
   return { id };
@@ -613,6 +695,25 @@ function normalizeContentType(value) {
   return /^[a-z0-9.+-]+\/[a-z0-9.+-]+$/.test(contentType) ? contentType : "application/octet-stream";
 }
 
+function scanEvent(status) {
+  return {
+    scan_clean: "file_scan_clean",
+    scan_suspicious: "file_scan_suspicious",
+    scan_failed: "file_scan_failed",
+    scan_unavailable: "file_scan_unavailable",
+    scan_pending: "file_scan_pending"
+  }[status] || "file_scan_failed";
+}
+
+function processingBlockedError(scanStatus) {
+  const error = new Error(scanStatus === "scan_suspicious"
+    ? "Suspicious files are blocked from processing"
+    : "Evidence processing requires a clean scan, or an explicit development-only scan bypass");
+  error.status = 409;
+  error.code = "FILE_SCAN_BLOCKED";
+  return error;
+}
+
 function decodeBase64(value) {
   const encoded = String(value || "");
   if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) {
@@ -626,6 +727,7 @@ if (process.env.NODE_ENV !== "test") {
     process.stderr.write(`ComplianceIQ API listening on http://${config.apiHost}:${config.port}\n`);
   });
   const shutdown = () => server.close(async () => {
+    processingQueue.stop();
     await repo.close?.();
     process.exit(0);
   });
@@ -633,4 +735,6 @@ if (process.env.NODE_ENV !== "test") {
   process.once("SIGINT", shutdown);
 }
 
-export { server, repo };
+server.on("close", () => processingQueue.stop());
+
+export { server, repo, processingQueue, malwareScanner };

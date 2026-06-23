@@ -10,14 +10,18 @@ test("API requires auth and blocks cross-organization access", async () => {
   process.env.REPOSITORY_BACKEND = "file";
   process.env.FILE_REPOSITORY_PATH = path.join(dir, "db.json");
   process.env.UPLOAD_DIR = path.join(dir, "private-storage");
+  process.env.STORAGE_BACKEND = "local";
   process.env.MAX_UPLOAD_MB = "5";
   process.env.SESSION_SECRET = "test-session-secret-with-enough-length";
   process.env.AI_ENABLED = "true";
   process.env.AI_PROVIDER = "mock";
   process.env.AI_CONFIDENCE_THRESHOLD = "0.8";
   process.env.AI_REVIEW_REQUIRED_THRESHOLD = "0.7";
+  process.env.MALWARE_SCAN_ENABLED = "true";
+  process.env.MALWARE_SCANNER_PROVIDER = "mock";
+  process.env.QUEUE_MAX_RETRIES = "2";
 
-  const { server, repo } = await import("../apps/api/src/server.js");
+  const { server, repo, processingQueue } = await import("../apps/api/src/server.js");
   const { hashPassword } = await import("../apps/api/src/security.js");
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = server.address().port;
@@ -112,13 +116,28 @@ test("API requires auth and blocks cross-organization access", async () => {
     });
     assert.equal(upload.status, 201);
     const evidence = await upload.json();
-    assert.equal(evidence.aiAnalysis.detectedEvidenceType, "loto_procedures");
-    assert.equal(evidence.aiAnalysis.provider, "mock");
+    assert.equal(evidence.scanStatus, "scan_clean");
+    assert.equal(evidence.processingJob.status, "queued");
+    assert.equal(evidence.aiAnalysis, undefined);
+
+    await processingQueue.drain();
 
     assert.equal((await fetch(`${base}/api/evidence/${evidence.id}/process-ai`, { method: "POST" })).status, 401);
     const analysisResponse = await fetch(`${base}/api/evidence/${evidence.id}/ai-analysis`, { headers: { cookie } });
     assert.equal(analysisResponse.status, 200);
-    assert.equal((await analysisResponse.json()).needsHumanReview, false);
+    const initialAnalysis = await analysisResponse.json();
+    assert.equal(initialAnalysis.needsHumanReview, false);
+    assert.equal(initialAnalysis.provider, "mock");
+    assert.equal(initialAnalysis.analysisVersion, 1);
+    assert.match(initialAnalysis.contentHash, /^[a-f0-9]{64}$/);
+    assert.match(initialAnalysis.outputHash, /^[a-f0-9]{64}$/);
+
+    const reprocess = await fetch(`${base}/api/evidence/${evidence.id}/process-ai`, { method: "POST", headers: { "Content-Type": "application/json", cookie }, body: "{}" });
+    assert.equal(reprocess.status, 202);
+    await processingQueue.drain();
+    const history = await fetch(`${base}/api/evidence/${evidence.id}/ai-analyses`, { headers: { cookie } });
+    assert.equal(history.status, 200);
+    assert.deepEqual((await history.json()).map((item) => item.analysisVersion), [2, 1]);
 
     const acceptClassification = await fetch(`${base}/api/evidence/${evidence.id}/ai-review`, {
       method: "PATCH",
@@ -185,6 +204,7 @@ test("API requires auth and blocks cross-organization access", async () => {
       body: JSON.stringify({ action: "mark_rejected" })
     });
     assert.equal(deniedReview.status, 403);
+    assert.equal((await fetch(`${base}/api/evidence-review-queue?facilityId=${facility.id}`, { headers: { cookie: viewerCookie } })).status, 403);
 
     const deniedEvidence = await fetch(`${base}/api/evidence/${evidence.id}/download`, { headers: { cookie: cookieB } });
     assert.equal(deniedEvidence.status, 403);
@@ -197,6 +217,8 @@ test("API requires auth and blocks cross-organization access", async () => {
     const deniedAnalysis = await fetch(`${base}/api/evidence/${evidence.id}/ai-analysis`, { headers: { cookie: cookieB } });
     assert.equal(deniedAnalysis.status, 403);
     const auditLogs = await repo.listAuditLogs(orgA.id, facility.id);
+    assert.ok(auditLogs.some((entry) => entry.action === "evidence_processing_queued"));
+    assert.ok(auditLogs.some((entry) => entry.action === "file_scan_clean"));
     assert.ok(auditLogs.some((entry) => entry.action === "ai_classification_generated"));
     assert.ok(auditLogs.some((entry) => entry.action === "human_accepted_ai_result"));
     assert.ok(auditLogs.some((entry) => entry.action === "packet_exported_with_ai_lineage"));

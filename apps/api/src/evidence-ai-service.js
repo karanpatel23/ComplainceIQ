@@ -1,33 +1,67 @@
-import { extractEvidenceText, providerMetadata } from "../../../packages/ai/src/index.js";
+import { createHash } from "node:crypto";
+import path from "node:path";
+import { createOcrProvider, extractEvidenceText, providerMetadata } from "../../../packages/ai/src/index.js";
 import { getApplicableRules } from "../../../packages/rules/src/index.js";
 import { notFound, validationError } from "../../../packages/shared/src/index.js";
 
-export function createEvidenceAiService({ config, repo, storage, provider }) {
+export function createEvidenceAiService({ config, repo, storage, provider, ocrProvider = createOcrProvider() }) {
   return {
-    async processEvidence({ organizationId, evidenceId, userId }) {
+    async processEvidence({ organizationId, evidenceId, userId, processingJobId = null, createdByType = "system" }) {
       const evidence = await repo.getEvidence(organizationId, evidenceId);
       if (!evidence) throw notFound("Evidence not found");
       const facility = await repo.getFacility(organizationId, evidence.facilityId);
       if (!facility) throw notFound("Facility not found");
       const { rules: applicableRules } = getApplicableRules(facility);
       const metadata = providerMetadata(provider);
-      let analysis = await repo.upsertAiAnalysis(baseAnalysis({ evidence, metadata, processingStatus: "processing" }));
+      const jobAnalysis = processingJobId ? await repo.getAiAnalysisByJobId(organizationId, processingJobId) : null;
+      if (jobAnalysis && ["processed", "needs_review"].includes(jobAnalysis.processingStatus)) return jobAnalysis;
+      let analysis = await repo.upsertAiAnalysis({
+        ...baseAnalysis({ evidence, metadata, processingStatus: "processing" }),
+        ...(jobAnalysis || {}),
+        processingStatus: "processing",
+        processingJobId,
+        createdByType,
+        error: null
+      });
       await logAiEvent(repo, { organizationId, facilityId: facility.id, userId, evidenceId, analysisId: analysis.id, action: "evidence_processing_started", metadata: { provider: metadata.provider } });
+      if (!jobAnalysis) await logAiEvent(repo, { organizationId, facilityId: facility.id, userId, evidenceId, analysisId: analysis.id, action: "ai_analysis_version_created", metadata: { analysisVersion: analysis.analysisVersion, processingJobId } });
+      if (!jobAnalysis && analysis.analysisVersion > 1) {
+        await logAiEvent(repo, { organizationId, facilityId: facility.id, userId, evidenceId, analysisId: analysis.id, action: "evidence_reprocessing_started", metadata: { analysisVersion: analysis.analysisVersion, previousAnalysisId: analysis.previousAnalysisId } });
+      }
 
       try {
         const buffer = evidence.fileReference ? await storage.readBuffer(evidence.fileReference) : null;
-        const extraction = extractEvidenceText({
+        let extraction = await extractEvidenceText({
           buffer,
           fileName: evidence.fileName,
           evidence,
-          maxChars: config.aiMaxFileTextChars
+          maxChars: config.aiMaxFileTextChars,
+          maxBytes: config.maxUploadMb * 1024 * 1024
         });
+        if (extraction.textExtractionStatus === "ocr_required" && buffer && ocrProvider.available) {
+          const isPdf = path.extname(evidence.fileName || "").toLowerCase() === ".pdf";
+          const ocr = isPdf
+            ? await ocrProvider.extractTextFromScannedPdf({ buffer, evidence })
+            : await ocrProvider.extractTextFromImage({ buffer, evidence });
+          if (ocr.text) {
+            extraction = {
+              text: ocr.text.slice(0, config.aiMaxFileTextChars),
+              textExtractionStatus: "extracted",
+              truncated: ocr.text.length > config.aiMaxFileTextChars,
+              warning: ocr.issues?.join("; ") || null
+            };
+          }
+        }
+        const contentHash = evidence.fileSha256 || createHash("sha256").update(extraction.text || "").digest("hex");
 
         if (!config.aiEnabled) {
           analysis = await repo.upsertAiAnalysis({
             ...baseAnalysis({ evidence, metadata, processingStatus: "needs_review" }),
             id: analysis.id,
             textExtractionStatus: extraction.textExtractionStatus,
+            processingJobId,
+            createdByType,
+            contentHash,
             needsHumanReview: true,
             issues: extraction.warning ? [extraction.warning] : [],
             error: "AI Evidence Intelligence is disabled. Manual review remains available."
@@ -37,11 +71,14 @@ export function createEvidenceAiService({ config, repo, storage, provider }) {
           return analysis;
         }
 
-        if (extraction.textExtractionStatus === "unsupported_for_text_extraction" || !extraction.text) {
+        if (["unsupported_for_text_extraction", "extraction_failed", "ocr_required", "empty"].includes(extraction.textExtractionStatus) || !extraction.text) {
           analysis = await repo.upsertAiAnalysis({
             ...baseAnalysis({ evidence, metadata, processingStatus: "needs_review" }),
             id: analysis.id,
             textExtractionStatus: extraction.textExtractionStatus,
+            processingJobId,
+            createdByType,
+            contentHash,
             needsHumanReview: true,
             issues: [extraction.warning || "No extractable text was available."],
             error: extraction.warning || "No extractable text was available."
@@ -63,6 +100,10 @@ export function createEvidenceAiService({ config, repo, storage, provider }) {
         analysis = await repo.upsertAiAnalysis({
           ...baseAnalysis({ evidence, metadata, processingStatus: needsHumanReview ? "needs_review" : "processed" }),
           id: analysis.id,
+          processingJobId,
+          createdByType,
+          contentHash,
+          outputHash: createHash("sha256").update(JSON.stringify(output)).digest("hex"),
           textExtractionStatus: extraction.textExtractionStatus,
           detectedEvidenceType: output.detectedEvidenceType,
           detectedTitle: output.detectedTitle,
@@ -95,6 +136,9 @@ export function createEvidenceAiService({ config, repo, storage, provider }) {
         analysis = await repo.upsertAiAnalysis({
           ...baseAnalysis({ evidence, metadata, processingStatus: "failed" }),
           id: analysis.id,
+          processingJobId,
+          createdByType,
+          contentHash: evidence.fileSha256 || analysis.contentHash || null,
           textExtractionStatus: analysis.textExtractionStatus || "failed",
           needsHumanReview: true,
           error: safeError(error)
@@ -154,6 +198,10 @@ export function createEvidenceAiService({ config, repo, storage, provider }) {
       } else if (reviewInput.action === "mark_rejected") {
         evidenceUpdates.status = "rejected";
         auditAction = "human_marked_evidence_rejected";
+      } else if (reviewInput.action === "request_more_evidence") {
+        evidenceUpdates.status = "needs_review";
+        analysisUpdates.needsHumanReview = true;
+        auditAction = "human_requested_more_evidence";
       } else {
         evidenceUpdates.status = "needs_review";
         analysisUpdates.needsHumanReview = true;
@@ -221,6 +269,10 @@ function baseAnalysis({ evidence, metadata, processingStatus }) {
     model: metadata.model,
     promptVersion: metadata.promptVersion,
     rawModelOutputReference: null,
+    processingJobId: null,
+    createdByType: "system",
+    contentHash: evidence.fileSha256 || null,
+    outputHash: null,
     error: null,
     humanReviewed: false,
     humanAcceptedAiResult: false,

@@ -18,7 +18,7 @@ test("audit packet generator returns a PDF buffer with required title", () => {
 });
 
 test("audit packet includes AI lineage and paginates long content", () => {
-  const evidence = [{ id: "e1", title: "Forklift certificate", evidenceType: "forklift_training_records", status: "accepted" }];
+  const evidence = [{ id: "e1", title: "Forklift certificate", evidenceType: "forklift_training_records", status: "accepted", scanStatus: "scan_clean", reviewerNotes: "Verified against training roster." }];
   const gapRows = Array.from({ length: 55 }, (_, index) => ({
     priority: index === 0 ? "high" : "medium",
     status: index === 0 ? "accepted" : "missing",
@@ -38,7 +38,8 @@ test("audit packet includes AI lineage and paginates long content", () => {
     findings: [],
     aiAnalyses: [{
       evidenceId: "e1", detectedEvidenceType: "forklift_training_records", confidence: 0.92,
-      processingStatus: "processed", extractedDocumentDate: "2025-03-14", extractedExpirationDate: "2028-03-14",
+      processingStatus: "processed", textExtractionStatus: "extracted", analysisVersion: 2, processingJobId: "job-2",
+      extractedDocumentDate: "2025-03-14", extractedExpirationDate: "2028-03-14",
       suggestedObligationTitle: "Powered industrial truck training", matchReason: "Type agreement", humanReviewed: true,
       needsHumanReview: false, issues: []
     }]
@@ -47,5 +48,8 @@ test("audit packet includes AI lineage and paginates long content", () => {
   assert.ok(text.includes("AI Evidence Intelligence and Audit Lineage"));
   assert.ok(text.includes(AI_EVIDENCE_DISCLAIMER.slice(0, 70)));
   assert.ok(text.includes("human_reviewed"));
+  assert.ok(text.includes("Analysis version: 2"));
+  assert.ok(text.includes("Scan: scan_clean"));
+  assert.ok(text.includes("Processing and Review Summary"));
   assert.match(text, /\/Count [2-9]/);
 });

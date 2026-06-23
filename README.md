@@ -16,10 +16,10 @@ Starter rules are demo/unverified unless separately expert-reviewed. The system 
 
 ## Repository Structure
 
-- `apps/api` - Node HTTP API, authentication, tenant scoping, review generation, evidence and packet downloads
+- `apps/api` - Node HTTP API, authentication, queue worker, scanning/storage adapters, reviewer operations, and protected downloads
 - `apps/web` - focused Audit Packet Builder frontend
 - `packages/config` - environment validation
-- `packages/ai` - validated provider abstraction, bounded extraction, and AI evidence contracts
+- `packages/ai` - validated provider abstraction, bounded text/PDF extraction, OCR-ready interface, and AI evidence contracts
 - `packages/db` - tracked Postgres migrations plus production Postgres and development file repositories
 - `packages/rules` - jurisdiction-specific rules packs, applicability, gap matrix, scoring, action plan
 - `packages/pdf` - backend audit packet PDF generation
@@ -41,8 +41,9 @@ Required for production:
 - `DATABASE_URL`
 - `REPOSITORY_BACKEND=postgres`
 - `SESSION_SECRET` with at least 32 characters
-- `UPLOAD_STORAGE_BACKEND`
-- `UPLOAD_DIR`
+- `STORAGE_BACKEND=s3`
+- `S3_BUCKET`
+- `S3_REGION`
 - `MAX_UPLOAD_MB`
 
 Optional:
@@ -59,6 +60,10 @@ Optional:
 - `AI_MAX_FILE_TEXT_CHARS`
 - `AI_CONFIDENCE_THRESHOLD`
 - `AI_REVIEW_REQUIRED_THRESHOLD`
+- `QUEUE_BACKEND`, `QUEUE_CONCURRENCY`, `QUEUE_MAX_RETRIES`
+- `S3_ENDPOINT`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_FORCE_PATH_STYLE`
+- `SIGNED_URL_EXPIRY_SECONDS`
+- `MALWARE_SCAN_ENABLED`, `MALWARE_SCAN_REQUIRED_IN_PRODUCTION`, `MALWARE_SCANNER_PROVIDER`
 - SMTP variables
 
 OpenAI and SMTP are optional. The core audit packet workflow works without them.
@@ -96,7 +101,34 @@ AI_REVIEW_REQUIRED_THRESHOLD=0.7
 
 Do not expose `OPENAI_API_KEY` to the web app. Model output is validated against a strict application schema and applicable rule IDs before storage. Raw prompts, extracted document text, and raw model output are not stored.
 
-Supported extraction in this phase is bounded plain text (`.txt`, `.md`, `.csv`, `.json`, `.log`, `.xml`, `.yaml`, `.yml`). PDF files and images/scans are stored privately and marked `needs_review`; OCR and production PDF text extraction are intentionally deferred.
+Supported extraction includes bounded plain text (`.txt`, `.md`, `.csv`, `.json`, `.log`, `.xml`, `.yaml`, `.yml`) and digitally readable PDFs through `pdf-parse`. PDF input is size-bounded, extracted text is capped by `AI_MAX_FILE_TEXT_CHARS`, and corrupt or encrypted files fail into a visible review state. Images and scanned PDFs are marked `ocr_required`; an OCR provider interface and deterministic mock exist, but no production OCR engine is bundled.
+
+## Evidence Processing Lifecycle
+
+File intelligence is asynchronous:
+
+1. the authenticated API validates and privately stores the upload;
+2. the malware-scanning adapter records `scan_clean`, `scan_suspicious`, `scan_failed`, or `scan_unavailable`;
+3. permitted evidence receives one active processing job;
+4. the local worker claims queued jobs, extracts bounded text, calls the optional AI provider, validates output, and persists a new immutable analysis version;
+5. the worker regenerates the deterministic gap matrix/action plan and marks the job completed;
+6. failures retain a safe reason and retry with deterministic exponential delays up to `QUEUE_MAX_RETRIES`.
+
+`QUEUE_BACKEND=local` is an in-process development/single-instance adapter. The repository job contract, timestamps, attempt counters, and Postgres `SKIP LOCKED` claim query form the boundary for a future Redis, SQS, RabbitMQ, or BullMQ worker. Upload requests never wait for AI completion; the UI polls active jobs.
+
+## Malware Scanning
+
+Scanning is an adapter boundary rather than a fake antivirus claim. The development mock can produce clean/suspicious outcomes for tests. Disabled scanning records `scan_unavailable`; that bypass can enter AI processing only outside production. Suspicious evidence is blocked from AI processing and authenticated download, and scan events are audit logged.
+
+`MALWARE_SCAN_REQUIRED_IN_PRODUCTION=true` intentionally fails startup until an approved non-mock provider is configured. ComplianceIQ does not label the development mock as production protection.
+
+## AI Analysis Versioning
+
+Every reprocessing job creates a new `analysisVersion` linked through `previousAnalysisId`. Earlier model/provider/prompt metadata, content/output hashes, results, and timestamps remain available through the protected history endpoint. One row is explicitly current; human decisions update review/override fields without deleting prior model output. Audit packets use the current final reviewed state.
+
+## Evidence Review Queue
+
+Reviewer/admin users receive a focused Evidence Review Queue inside the Audit Packet Builder. It groups and filters tenant-scoped work by facility, confidence, extraction/OCR failure, suspicious scan, expiry/rejection, unmatched evidence, processing failure, and obligation priority impact. Review actions reuse the protected human-review API and immediately regenerate deterministic gap/action results.
 
 ## Local Setup
 
@@ -150,6 +182,8 @@ Customer-owned tables include `organization_id` and indexes for tenant-scoped ac
 Evidence matches are persisted when a backend review is generated, so the rule-to-evidence relationship survives API restarts along with gap rows, findings, action items, and packet metadata.
 
 `0002_persistence_hardening` persists `selected_rules_pack_id` on facilities, adds integrity constraints, and adds composite and foreign-key indexes for tenant-scoped access patterns. The API uses a bounded Postgres connection pool with connection, idle, and statement timeouts.
+
+`0003_ai_evidence_intelligence` adds tenant-scoped AI analysis and private file metadata. `0004_production_file_intelligence` adds scan state, bounded processing jobs, immutable analysis versions, lineage hashes, supersession links, queue claim indexes, and one-active-job/one-current-analysis constraints. PostgreSQL workers claim due jobs with `FOR UPDATE SKIP LOCKED`; external AI and file operations remain outside database transactions.
 
 ## Development Seed
 
@@ -219,7 +253,7 @@ To exercise the real Postgres repository adapter, provide a disposable test data
 TEST_DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/complianceiq_test npm test
 ```
 
-The Postgres integration test applies all tracked migrations, writes uniquely named tenant data, reinitializes the repository, and verifies facilities, selected rules-pack context, evidence, score explanations, gap rows, action items, evidence matches, packets, and audit logs. It is skipped unless `TEST_DATABASE_URL` points to a disposable real Postgres database.
+The Postgres integration test applies all tracked migrations, writes uniquely named tenant data, enqueues and processes evidence with mock AI, persists versioned analysis and human review, regenerates the matrix/action plan, writes packet metadata, reinitializes the repository, and verifies tenant isolation. It is explicitly skipped unless `TEST_DATABASE_URL` points to a disposable real Postgres database.
 
 ## API Summary
 
@@ -254,9 +288,13 @@ Evidence:
 - `DELETE /api/evidence/:id`
 - `GET /api/evidence/:id/download`
 - `POST /api/evidence/:id/process-ai`
+- `POST /api/evidence/:id/retry-processing` (admin/reviewer)
 - `GET /api/evidence/:id/ai-analysis`
+- `GET /api/evidence/:id/ai-analyses` (version history)
 - `PATCH /api/evidence/:id/ai-review` (admin/reviewer)
 - `GET /api/evidence-ai-analyses?facilityId=...`
+- `GET /api/evidence-processing-jobs?facilityId=...`
+- `GET /api/evidence-review-queue?facilityId=...&status=...&priority=...` (admin/reviewer)
 - `GET /api/evidence-taxonomy`
 - `GET /api/ai/status`
 
@@ -294,9 +332,11 @@ Expert review and logs:
 - JSON and upload bodies are size-limited before full buffering.
 - Expert review requests validate referenced facilities and reviews against the caller's organization.
 - Evidence and packet files are private file references and download through authenticated API routes.
+- Suspicious files are blocked before AI processing and before download; scan results and queue transitions are audit logged without raw file content.
+- S3 objects are written without public ACLs, use opaque keys, and remain behind authenticated backend downloads.
 - Client-supplied private file references are ignored; only backend storage writes can attach files.
 - AI calls occur only on the backend, receive bounded extracted text, and never run inside database transactions.
-- AI analysis and human overrides are tenant-scoped; override actions require admin or reviewer role and create audit events.
+- AI analyses, immutable history, processing jobs, reviewer queue rows, and human overrides are tenant-scoped; override/retry actions require admin or reviewer role and create audit events.
 - Raw document text and raw model responses are not stored in AI rows or audit logs.
 - The frontend escapes persisted content before rendering and restores the current session and latest persisted review after reload.
 - `SESSION_SECRET`, `DATABASE_URL`, and production CORS are validated at startup.
@@ -320,12 +360,12 @@ The result is clamped between 0 and 100, and the score explanation is persisted 
 
 ## Storage
 
-Storage is selected through a private-storage adapter factory. The implemented local adapter uses randomized references, traversal protection, restrictive filesystem permissions, size limits, and authenticated API downloads:
+Storage is selected through a private-storage adapter factory. The local adapter uses randomized references, traversal protection, restrictive filesystem permissions, size limits, and authenticated API downloads:
 
-- `UPLOAD_STORAGE_BACKEND=local`
+- `STORAGE_BACKEND=local`
 - `UPLOAD_DIR=data/private-storage`
 
-Production should replace this with a durable private object storage adapter such as S3, R2, or a private Supabase bucket. Public raw evidence URLs should not be exposed. A deployment using ephemeral local disk is **not production-ready** because evidence and generated packet files can disappear even though their Postgres metadata persists.
+The S3-compatible adapter uses the official AWS SDK and supports AWS S3, MinIO, R2-style endpoints, path-style addressing, explicit credentials, or the AWS credential chain. File references contain opaque private keys rather than public URLs. Downloads continue through tenant-authenticated API routes; direct signed URLs are not exposed by the current UI. Production configuration requires `STORAGE_BACKEND=s3`, bucket, and region. `S3_ENDPOINT` and path-style mode are optional for compatible providers.
 
 ## Deployment Checklist
 
@@ -334,7 +374,9 @@ Production should replace this with a durable private object storage adapter suc
 - Run `npm run db:migrate`
 - Provision the first administrator with `npm run admin:provision`, then remove its `PROVISION_*` secrets
 - Verify `npm test`, `npm run typecheck`, `npm run lint`, and `npm run build`
-- Configure private object storage for uploads and generated PDFs
+- Configure a private S3-compatible bucket for uploads and generated PDFs
+- Configure an approved malware scanner adapter before allowing production file intelligence; the mock is rejected in production
+- Size the local queue only for a single API instance, or replace it with a durable external queue before horizontal scaling
 - Run the optional `TEST_DATABASE_URL=... npm test` Postgres integration check against disposable infrastructure
 - Confirm CORS allows only trusted web origins
 - Confirm demo data is disabled
@@ -344,10 +386,12 @@ Production should replace this with a durable private object storage adapter suc
 ## Known Limitations
 
 - Starter rules are demo/unverified unless expert-reviewed.
-- OCR and PDF/image text extraction are not included; those files require manual review.
-- AI processing is synchronous in this phase; a durable background job queue is still required before high-volume production rollout.
+- Digitally readable PDF extraction is implemented; encrypted, corrupt, and scanned PDFs fail safely into review.
+- OCR interfaces and test mocks exist, but no production OCR engine is bundled.
+- The local queue is asynchronous and bounded but in-process; it is not durable across process crashes and is not suitable for multi-instance scheduling.
 - The mock provider is for tests/development only and is rejected in production.
-- Local private storage is not a production object-storage solution.
+- The malware scanner is an interface plus development mock. Production file processing must remain disabled until an approved provider is added.
+- S3-compatible storage is implemented, but bucket policies, KMS requirements, retention, lifecycle, and restore procedures remain deployment responsibilities.
 - A real Postgres integration run still requires a disposable `TEST_DATABASE_URL`; the self-contained suite deliberately does not emulate Postgres.
 - Login rate limiting and account recovery are not implemented yet.
 - The static frontend is focused on the core workflow; future work can replace it with a richer React/Next app without moving compliance logic to the client.
@@ -358,11 +402,11 @@ Production should replace this with a durable private object storage adapter suc
 The application code, authenticated routes, deterministic backend logic, file-adapter restart tests, environment validation, and builds are passing. Do **not** call a deployment production-ready until both of these environment-dependent gates pass:
 
 1. Run the integration suite against a disposable real Postgres instance via `TEST_DATABASE_URL`.
-2. Configure a durable private object-storage adapter; the implemented local adapter is development-only for deployments with ephemeral disks.
+2. Configure and exercise a private S3-compatible bucket plus an approved malware-scanner adapter.
 
 ## Next Recommended Sprint
 
-1. Add durable private object storage plus a background processing queue with idempotency and retry controls.
-2. Add vetted PDF text extraction and OCR with malware scanning, file-type verification, and extraction quality metrics.
-3. Run Postgres and AI mock integration suites in CI and add provider contract/evaluation datasets.
-4. Add distributed login and AI-processing rate limits, cost controls, and production account recovery.
+1. Replace the in-process queue with a durable Redis/SQS worker and add abandoned-job recovery/lease heartbeats.
+2. Integrate an approved malware scanner and production OCR provider with extraction-quality metrics.
+3. Run Postgres, S3-compatible, scanner, PDF, and AI mock integration suites in CI using disposable infrastructure.
+4. Add content-type sniffing, decompression-bomb defenses, KMS/retention policy verification, rate limits, and AI cost controls.

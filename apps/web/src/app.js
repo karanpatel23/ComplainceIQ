@@ -9,6 +9,9 @@ const state = {
   evidenceTypes: ["other"],
   aiStatus: { enabled: false, provider: "disabled", model: null },
   aiAnalyses: [],
+  processingJobs: [],
+  reviewQueue: [],
+  reviewQueueFilters: { status: "", priority: "" },
   applicableRules: [],
   latestReview: null,
   gapRows: [],
@@ -56,6 +59,7 @@ function appView() {
           <a class="active">Audit Packet Builder</a>
           <a>Facilities</a>
           <a>Evidence</a>
+          ${canReview() ? "<a>Evidence Review Queue</a>" : ""}
           <a>Gap Matrix</a>
           <a>Action Plan</a>
           <a>Audit Packets</a>
@@ -92,6 +96,7 @@ function appView() {
           ${facilityPanel()}
           ${evidencePanel()}
         </section>
+        ${reviewQueuePanel()}
         <section class="builder-band">
           <div>
             <h2>Jurisdiction-specific rules pack</h2>
@@ -178,17 +183,44 @@ function evidencePanel() {
 
 function evidenceCard(item) {
   const analysis = state.aiAnalyses.find((entry) => entry.evidenceId === item.id);
-  const canReview = ["admin", "reviewer"].includes(state.user.role);
+  const job = state.processingJobs.find((entry) => entry.evidenceId === item.id);
+  const active = ["queued", "processing"].includes(job?.status);
+  const blocked = ["scan_suspicious", "scan_pending"].includes(item.scanStatus);
   return `
     <article class="evidence-card">
       <div class="evidence-heading">
         <div><strong>${html(item.title)}</strong><span>${html(label(item.evidenceType))} · ${html(item.status)}${item.fileName ? ` · ${html(item.fileName)}` : ""}</span></div>
-        <button class="secondary" data-process-ai="${html(item.id)}" ${state.aiStatus.enabled ? "" : "disabled"}>${analysis ? "Reprocess" : "Process with AI"}</button>
+        <button class="secondary" data-process-ai="${html(item.id)}" ${state.aiStatus.enabled && !active && !blocked ? "" : "disabled"}>${active ? "Processing…" : analysis ? "Queue reprocessing" : "Queue AI processing"}</button>
       </div>
-      ${analysis ? aiAnalysisDetails(analysis) : `<p class="muted">No AI analysis yet. ${state.aiStatus.enabled ? "Process this evidence to classify it." : "AI is disabled; manual review remains available."}</p>`}
-      ${analysis && canReview ? aiReviewForm(item, analysis) : ""}
+      ${processingBadges(item, job, analysis)}
+      ${analysis ? aiAnalysisDetails(analysis) : `<p class="muted">No AI analysis yet. ${state.aiStatus.enabled ? "Processing begins after the private scan and queue claim." : "AI is disabled; manual review remains available."}</p>`}
+      ${analysis && canReview() ? aiReviewForm(item, analysis) : ""}
     </article>
   `;
+}
+
+function processingBadges(item, job, analysis) {
+  const lifecycle = processingLabel(item, job, analysis);
+  return `
+    <div class="badge-row processing-row">
+      <span class="status ${statusTone(item.scanStatus)}">${html(label(item.scanStatus || "scan_unavailable"))}</span>
+      <span class="status ${statusTone(lifecycle.code)}">${html(lifecycle.text)}</span>
+      ${job ? `<span class="status">Attempt ${job.processingAttempts}/${job.maxAttempts}</span>` : ""}
+    </div>
+    ${(job?.lastProcessingError || item.scanError) ? `<p class="processing-error">${html(job?.lastProcessingError || item.scanError)}</p>` : ""}
+  `;
+}
+
+function processingLabel(item, job, analysis) {
+  if (item.scanStatus === "scan_suspicious") return { code: "blocked", text: "Suspicious / blocked" };
+  if (item.scanStatus === "scan_pending") return { code: "queued", text: "Scan pending" };
+  if (analysis?.textExtractionStatus === "ocr_required") return { code: "ocr_required", text: "OCR / manual review required" };
+  if (job?.status === "queued") return { code: "queued", text: "Processing queued" };
+  if (job?.status === "processing") return { code: "processing", text: "Extracting text / AI analyzing" };
+  if (job?.status === "failed" || analysis?.processingStatus === "failed") return { code: "failed", text: "Processing failed" };
+  if (analysis?.processingStatus === "needs_review") return { code: "needs_review", text: "Needs review" };
+  if (analysis?.processingStatus === "processed") return { code: "processed", text: "Processed" };
+  return { code: "uploaded", text: "Uploaded" };
 }
 
 function aiAnalysisDetails(analysis) {
@@ -200,6 +232,7 @@ function aiAnalysisDetails(analysis) {
         <span class="status">Confidence ${html(confidence)}</span>
         <span class="status ${analysis.humanReviewed ? "accepted" : analysis.needsHumanReview ? "partial" : ""}">${analysis.humanReviewed ? "Human reviewed" : analysis.needsHumanReview ? "Needs review" : "AI matched"}</span>
       </div>
+      <p><strong>Analysis version:</strong> ${html(analysis.analysisVersion || 1)} · <strong>Extraction:</strong> ${html(label(analysis.textExtractionStatus || "not_started"))}</p>
       <p><strong>Likely type:</strong> ${html(label(analysis.detectedEvidenceType || "other"))}</p>
       <p>${html(analysis.summary || analysis.error || "No summary available.")}</p>
       <p><strong>Suggested obligation:</strong> ${html(analysis.suggestedObligationTitle || "No suggestion")}<br><strong>Reason:</strong> ${html(analysis.matchReason || "No AI match reason")}</p>
@@ -227,9 +260,65 @@ function aiReviewForm(item, analysis) {
         <button type="submit" name="action" value="override" class="secondary">Apply override</button>
         <button type="submit" name="action" value="mark_accepted">Mark evidence accepted</button>
         <button type="submit" name="action" value="mark_rejected" class="danger-button">Reject evidence</button>
+        <button type="submit" name="action" value="mark_needs_review" class="secondary">Keep in review</button>
+        <button type="submit" name="action" value="request_more_evidence" class="secondary">Request more evidence</button>
       </div>
     </form>
   `;
+}
+
+function reviewQueuePanel() {
+  if (!canReview()) return "";
+  const statusOptions = ["", "needs_review", "low_confidence", "medium_confidence", "extraction_failed", "ocr_required", "suspicious_scan", "expired", "rejected", "unmatched", "high_priority_impact", "processing_failed"];
+  const priorityOptions = ["", "critical", "high", "medium", "low"];
+  return `
+    <section class="panel review-queue-panel">
+      <div class="queue-heading">
+        <div><p class="eyebrow">Reviewer operations</p><h2>Evidence Review Queue</h2><p>Tenant-scoped evidence requiring a human decision, safer extraction, or processing recovery.</p></div>
+        <form id="review-queue-filters" class="queue-filters">
+          <label>Status<select name="status">${statusOptions.map((value) => `<option value="${value}" ${value === state.reviewQueueFilters.status ? "selected" : ""}>${html(value ? label(value) : "All review states")}</option>`).join("")}</select></label>
+          <label>Priority impact<select name="priority">${priorityOptions.map((value) => `<option value="${value}" ${value === state.reviewQueueFilters.priority ? "selected" : ""}>${html(value ? label(value) : "All priorities")}</option>`).join("")}</select></label>
+        </form>
+      </div>
+      <div class="review-queue-list">
+        ${state.reviewQueue.length ? state.reviewQueue.map(reviewQueueCard).join("") : "<p>No evidence matches the selected review filters.</p>"}
+      </div>
+    </section>
+  `;
+}
+
+function reviewQueueCard(item) {
+  const evidence = state.evidence.find((entry) => entry.id === item.id);
+  const analysis = state.aiAnalyses.find((entry) => entry.evidenceId === item.id);
+  const canRetry = item.processingStatus === "failed" || item.categories.some((category) => ["processing_failed", "extraction_failed", "ocr_required"].includes(category));
+  return `
+    <article class="review-queue-card ${item.scanStatus === "scan_suspicious" ? "blocked-card" : ""}">
+      <div class="queue-card-summary">
+        <div><strong>${html(item.evidenceTitle)}</strong><span>${html(item.facilityName)} · ${html(item.fileName || "Manual evidence")}</span></div>
+        <div class="badge-row">
+          <span class="status ${statusTone(item.priorityImpact)}">${html(item.priorityImpact)} impact</span>
+          <span class="status">${item.confidence === null ? "No confidence" : `${Math.round(item.confidence * 100)}% confidence`}</span>
+          <span class="status ${statusTone(item.processingStatus)}">${html(label(item.processingStatus))}</span>
+        </div>
+      </div>
+      <p><strong>Likely type:</strong> ${html(label(item.detectedEvidenceType || "other"))} · <strong>Suggested obligation:</strong> ${html(item.suggestedObligationTitle || "Unmatched")}</p>
+      <p><strong>Review reasons:</strong> ${item.categories.map((category) => html(label(category))).join(", ")}</p>
+      ${item.issueSummary.length ? `<ul>${item.issueSummary.map((issue) => `<li>${html(issue)}</li>`).join("")}</ul>` : ""}
+      ${canRetry && item.scanStatus !== "scan_suspicious" ? `<button class="secondary" data-retry-processing="${html(item.id)}">Retry processing</button>` : ""}
+      ${evidence && analysis ? aiReviewForm(evidence, analysis) : ""}
+    </article>
+  `;
+}
+
+function canReview() {
+  return ["admin", "reviewer"].includes(state.user?.role);
+}
+
+function statusTone(value) {
+  if (["processed", "scan_clean", "accepted"].includes(value)) return "accepted";
+  if (["failed", "blocked", "scan_suspicious", "critical", "rejected"].includes(value)) return "rejected";
+  if (["queued", "processing", "needs_review", "ocr_required", "high", "medium", "scan_unavailable"].includes(value)) return "partial";
+  return "";
 }
 
 function scorePanel() {
@@ -279,6 +368,7 @@ function gapAiInsights(row) {
     <div class="matrix-ai">
       <strong>${html(label(insight.detectedEvidenceType || "other"))}</strong>
       <span>${html(insight.matchSource)} · ${insight.confidence === null || insight.confidence === undefined ? "N/A" : `${Math.round(insight.confidence * 100)}%`}</span>
+      <span>v${html(insight.analysisVersion || 1)} · ${html(label(insight.textExtractionStatus || "not_started"))}</span>
       <span>${insight.humanReviewed ? "Human reviewed" : insight.needsHumanReview ? "Needs review" : "AI matched"}</span>
     </div>
   `).join("");
@@ -342,8 +432,10 @@ function bindEvents() {
   document.querySelector("#generate-review")?.addEventListener("click", onGenerateReview);
   document.querySelector("#export-packet")?.addEventListener("click", onExportPacket);
   document.querySelectorAll("[data-process-ai]").forEach((button) => button.addEventListener("click", () => onProcessAi(button.dataset.processAi)));
+  document.querySelectorAll("[data-retry-processing]").forEach((button) => button.addEventListener("click", () => onRetryProcessing(button.dataset.retryProcessing)));
   document.querySelectorAll("[data-ai-review]").forEach((form) => form.addEventListener("submit", onReviewAi));
   document.querySelectorAll("[data-packet-download]").forEach((button) => button.addEventListener("click", () => onDownloadPacket(button.dataset.packetDownload)));
+  document.querySelector("#review-queue-filters")?.addEventListener("change", onReviewQueueFilter);
 }
 
 async function onLogin(event) {
@@ -359,7 +451,7 @@ async function onLogin(event) {
 async function onLogout() {
   await run(async () => {
     await api("/api/auth/logout", { method: "POST", body: {} });
-    Object.assign(state, { user: null, organization: null, facilities: [], selectedFacilityId: null, evidence: [], aiAnalyses: [], applicableRules: [], latestReview: null, gapRows: [], actionItems: [], packets: [] });
+    Object.assign(state, { user: null, organization: null, facilities: [], selectedFacilityId: null, evidence: [], aiAnalyses: [], processingJobs: [], reviewQueue: [], applicableRules: [], latestReview: null, gapRows: [], actionItems: [], packets: [] });
     render();
   });
 }
@@ -380,6 +472,8 @@ async function refreshFacilityData() {
   if (!facility) {
     state.evidence = [];
     state.aiAnalyses = [];
+    state.processingJobs = [];
+    state.reviewQueue = [];
     state.applicableRules = [];
     state.packets = [];
     state.latestReview = null;
@@ -389,16 +483,18 @@ async function refreshFacilityData() {
     return;
   }
   const facilityId = encodeURIComponent(facility.id);
-  const [evidence, packets, reviews, aiAnalyses, applicable] = await Promise.all([
+  const [evidence, packets, reviews, aiAnalyses, applicable, processingJobs] = await Promise.all([
     api(`/api/evidence?facilityId=${facilityId}`),
     api(`/api/audit-packets?facilityId=${facilityId}`),
     api(`/api/audit-readiness/reviews?facilityId=${facilityId}`),
     api(`/api/evidence-ai-analyses?facilityId=${facilityId}`),
-    api(`/api/facilities/${facilityId}/applicable-rules`)
+    api(`/api/facilities/${facilityId}/applicable-rules`),
+    api(`/api/evidence-processing-jobs?facilityId=${facilityId}`)
   ]);
   state.evidence = evidence;
   state.packets = packets;
   state.aiAnalyses = aiAnalyses;
+  state.processingJobs = processingJobs;
   state.applicableRules = applicable.rules || [];
   state.latestReview = reviews[0] || null;
   if (state.latestReview) {
@@ -411,6 +507,7 @@ async function refreshFacilityData() {
     state.gapRows = [];
     state.actionItems = [];
   }
+  if (canReview()) await refreshReviewQueue(false);
   render();
 }
 
@@ -461,6 +558,32 @@ async function onProcessAi(evidenceId) {
     await api(`/api/evidence/${encodeURIComponent(evidenceId)}/process-ai`, { method: "POST", body: {} });
     await refreshFacilityData();
   });
+}
+
+async function onRetryProcessing(evidenceId) {
+  await run(async () => {
+    await api(`/api/evidence/${encodeURIComponent(evidenceId)}/retry-processing`, { method: "POST", body: {} });
+    await refreshFacilityData();
+  });
+}
+
+async function onReviewQueueFilter(event) {
+  const form = new FormData(event.currentTarget);
+  state.reviewQueueFilters = { status: String(form.get("status") || ""), priority: String(form.get("priority") || "") };
+  await run(async () => refreshReviewQueue());
+}
+
+async function refreshReviewQueue(shouldRender = true) {
+  const facility = currentFacility();
+  if (!canReview() || !facility) {
+    state.reviewQueue = [];
+    return;
+  }
+  const params = new URLSearchParams({ facilityId: facility.id });
+  if (state.reviewQueueFilters.status) params.set("status", state.reviewQueueFilters.status);
+  if (state.reviewQueueFilters.priority) params.set("priority", state.reviewQueueFilters.priority);
+  state.reviewQueue = await api(`/api/evidence-review-queue?${params}`);
+  if (shouldRender) render();
 }
 
 async function onReviewAi(event) {
@@ -571,3 +694,17 @@ async function initialize() {
 }
 
 initialize();
+
+let polling = false;
+window.setInterval(async () => {
+  if (!state.user || polling || !state.processingJobs.some((job) => ["queued", "processing"].includes(job.status))) return;
+  polling = true;
+  try {
+    await refreshFacilityData();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  } finally {
+    polling = false;
+  }
+}, 2_500);

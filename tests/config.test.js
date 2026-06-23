@@ -10,8 +10,9 @@ const productionEnv = {
   DATABASE_URL: "postgresql://user:password@db.example.com:5432/complianceiq",
   REPOSITORY_BACKEND: "postgres",
   SESSION_SECRET: "replace-with-at-least-thirty-two-characters",
-  UPLOAD_STORAGE_BACKEND: "local",
-  UPLOAD_DIR: "data/private-storage",
+  STORAGE_BACKEND: "s3",
+  S3_BUCKET: "complianceiq-private",
+  S3_REGION: "ca-central-1",
   MAX_UPLOAD_MB: "25"
 };
 
@@ -36,6 +37,16 @@ test("production config accepts optional integrations as absent", () => {
   assert.equal(config.repositoryBackend, "postgres");
   assert.equal(config.databaseUrl, productionEnv.DATABASE_URL);
   assert.equal(config.enableDemoData, false);
+  assert.equal(config.storageBackend, "s3");
+});
+
+test("production storage and malware scanning config fail safely", () => {
+  assert.throws(() => readConfig({ ...productionEnv, STORAGE_BACKEND: "local" }), /must be s3/);
+  assert.throws(() => readConfig({ ...productionEnv, S3_BUCKET: "" }), /S3_BUCKET/);
+  assert.throws(() => readConfig({ ...productionEnv, MALWARE_SCAN_ENABLED: "true", MALWARE_SCANNER_PROVIDER: "mock" }), /mock is not allowed/);
+  const local = readConfig({ NODE_ENV: "development", REPOSITORY_BACKEND: "file", STORAGE_BACKEND: "local" });
+  assert.equal(local.queueMaxRetries, 3);
+  assert.equal(local.malwareScanEnabled, false);
 });
 
 test("repository config requires Postgres in production without requiring unrelated runtime settings", () => {

@@ -1,7 +1,10 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { generateAuditPacketPdf } from "../packages/pdf/src/index.js";
 
-const evidence = [{ id: "evidence-1", title: "Forklift Operator Training Certificate", evidenceType: "forklift_training_records", status: "accepted" }];
+const evidence = [
+  { id: "evidence-1", title: "Forklift Operator Training Certificate", evidenceType: "forklift_training_records", status: "accepted", scanStatus: "scan_clean", reviewerNotes: "Verified against the facility training roster." },
+  { id: "evidence-2", title: "Scanned Machine Guard Inspection", evidenceType: "other", status: "needs_review", scanStatus: "scan_suspicious", reviewerNotes: "Blocked pending security review." }
+];
 const gapRows = Array.from({ length: 24 }, (_, index) => ({
   priority: index === 0 ? "high" : "medium",
   status: index === 0 ? "accepted" : "missing",
@@ -22,10 +25,18 @@ const pdf = generateAuditPacketPdf({
   findings: [{ severity: "high", title: "Training evidence requires review" }],
   aiAnalyses: [{
     evidenceId: "evidence-1", detectedEvidenceType: "forklift_training_records", confidence: 0.92,
-    processingStatus: "processed", extractedDocumentDate: "2025-03-14", extractedExpirationDate: "2028-03-14",
+    processingStatus: "processed", textExtractionStatus: "extracted", analysisVersion: 2, processingJobId: "job-2",
+    extractedDocumentDate: "2025-03-14", extractedExpirationDate: "2028-03-14",
     extractedEmployeeNames: ["Sample Operator"], extractedEquipmentNames: ["Forklift"], extractedChemicalNames: [], extractedSignaturePresent: true,
     suggestedObligationTitle: "Powered industrial truck training", matchReason: "Detected type agrees with deterministic evidence taxonomy.",
-    humanReviewed: true, needsHumanReview: false, issues: []
+    humanReviewed: true, humanReviewNotes: "Classification and roster were reviewed.", needsHumanReview: false, issues: []
+  }, {
+    evidenceId: "evidence-2", detectedEvidenceType: null, confidence: null,
+    processingStatus: "needs_review", textExtractionStatus: "ocr_required", analysisVersion: 1, processingJobId: "job-3",
+    extractedDocumentDate: null, extractedExpirationDate: null,
+    extractedEmployeeNames: [], extractedEquipmentNames: [], extractedChemicalNames: [], extractedSignaturePresent: null,
+    suggestedObligationTitle: null, matchReason: null, humanReviewed: false, needsHumanReview: true,
+    issues: ["Text could not be extracted. OCR or manual review required."]
   }]
 });
 

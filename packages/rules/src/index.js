@@ -171,7 +171,7 @@ export function buildGapMatrix(facility, rules, evidence, rulesPack, now = new D
 
     const acceptedTypes = new Set(
       matchedEvidence
-        .filter((item) => item.status === "accepted" && !isExpired(item, now))
+        .filter((item) => item.status === "accepted" && item.scanStatus !== "scan_suspicious" && !isExpired(item, now))
         .map((item) => effectiveEvidenceType(item, aiAnalyses))
     );
     const expiredCount = matchedEvidence.filter((item) => isExpired(item, now)).length;
@@ -235,6 +235,8 @@ function buildAiInsights(ruleItem, relatedMatches, aiAnalyses) {
     .map((analysis) => ({
       evidenceId: analysis.evidenceId,
       processingStatus: analysis.processingStatus,
+      analysisVersion: analysis.analysisVersion || 1,
+      textExtractionStatus: analysis.textExtractionStatus,
       detectedEvidenceType: analysis.detectedEvidenceType,
       confidence: analysis.confidence,
       needsHumanReview: analysis.needsHumanReview,

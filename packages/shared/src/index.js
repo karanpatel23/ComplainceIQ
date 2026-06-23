@@ -2,6 +2,8 @@ export const COUNTRIES = ["US", "CA", "MX"];
 
 export const PRIORITIES = ["critical", "high", "medium", "low"];
 export const EVIDENCE_STATUSES = ["pending", "accepted", "rejected", "expired", "needs_review"];
+export const FILE_SCAN_STATUSES = ["scan_pending", "scan_clean", "scan_failed", "scan_suspicious", "scan_unavailable"];
+export const PROCESSING_JOB_STATUSES = ["queued", "processing", "completed", "failed", "cancelled"];
 export const GAP_STATUSES = ["missing", "partial", "accepted", "rejected", "expired", "not_applicable"];
 export const USER_ROLES = ["admin", "compliance_manager", "reviewer", "auditor", "executive"];
 export const EVIDENCE_TAXONOMY = [
@@ -162,6 +164,10 @@ export function parseEvidenceInput(input, organizationId, uploadedByUserId) {
     contentType: optionalString(input.contentType),
     fileSizeBytes: optionalInteger(input.fileSizeBytes),
     fileSha256: optionalString(input.fileSha256),
+    scanStatus: normalizeEnum(input.scanStatus ?? "scan_unavailable", FILE_SCAN_STATUSES, "scanStatus"),
+    scanProvider: optionalString(input.scanProvider),
+    scanError: optionalString(input.scanError),
+    scannedAt: optionalString(input.scannedAt),
     uploadedByUserId,
     country,
     region,
@@ -173,6 +179,12 @@ export function parseEvidenceInput(input, organizationId, uploadedByUserId) {
     reviewerNotes: optionalString(input.reviewerNotes),
     archived: Boolean(input.archived ?? false)
   };
+}
+
+function normalizeEnum(value, allowed, field) {
+  const normalized = String(value).trim();
+  if (!allowed.includes(normalized)) throw validationError(`${field} must be one of: ${allowed.join(", ")}`);
+  return normalized;
 }
 
 export function normalizeEvidenceType(value) {

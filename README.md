@@ -30,11 +30,13 @@ The original Replit export was used as reference only. Replit artifacts, broad d
 
 ## Environment Variables
 
-Copy `.env.example` to `.env` and set values for the target environment.
+Copy `.env.example` to `.env` for local work. Profile templates also live in `deploy/env/`.
 
 Required for production:
 
 - `NODE_ENV=production`
+- `DEPLOYMENT_PROFILE=staging` or `closed-pilot`
+- `PROCESS_ROLE=api` or `worker` (deploy both separately)
 - `PORT`
 - `APP_URL`
 - `ALLOWED_ORIGINS` without `*`
@@ -45,6 +47,7 @@ Required for production:
 - `S3_BUCKET`
 - `S3_REGION`
 - `MAX_UPLOAD_MB`
+- Closed pilot additionally requires enabled, required, fail-closed ClamAV scanning.
 
 Optional:
 
@@ -63,8 +66,9 @@ Optional:
 - `QUEUE_BACKEND`, `QUEUE_CONCURRENCY`, `QUEUE_MAX_RETRIES`, `QUEUE_LEASE_MS`, `QUEUE_HEARTBEAT_MS`, `QUEUE_POLL_MS`, `QUEUE_SHUTDOWN_TIMEOUT_MS`
 - `S3_ENDPOINT`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_FORCE_PATH_STYLE`
 - `SIGNED_URL_EXPIRY_SECONDS`
-- `MALWARE_SCAN_ENABLED`, `MALWARE_SCAN_REQUIRED_IN_PRODUCTION`, `MALWARE_SCANNER_PROVIDER`, `MALWARE_SCAN_TIMEOUT_MS`, `MALWARE_SCAN_FAIL_POLICY`
-- `CLAMAV_HOST`, `CLAMAV_PORT`
+- `MALWARE_SCAN_ENABLED`, `MALWARE_SCAN_REQUIRED_IN_PRODUCTION`, `MALWARE_SCANNER_PROVIDER`, `MALWARE_SCAN_FAIL_POLICY`
+- `CLAMAV_HOST`, `CLAMAV_PORT`, `CLAMAV_TIMEOUT_MS`
+- `LOG_LEVEL`, `WORKER_HEALTH_HOST`, `WORKER_HEALTH_PORT`
 - `TRUST_PROXY`, `SESSION_COOKIE_SAME_SITE`
 - SMTP variables
 
@@ -120,11 +124,11 @@ File intelligence is asynchronous:
 5. the worker regenerates the deterministic gap matrix/action plan and marks the job completed;
 6. failures retain a safe reason and retry with deterministic exponential delays up to `QUEUE_MAX_RETRIES`; an exhausted job enters `dead_letter` for operator review.
 
-`QUEUE_BACKEND=local` schedules work in the API process, while the job state and leases live in the repository. PostgreSQL uses `FOR UPDATE SKIP LOCKED`, partial claim indexes, compare-and-set lease completion, heartbeats, stale-lease recovery, bounded retries, and dead-letter state. Multiple workers cannot successfully own the same lease. Graceful shutdown stops new claims and waits up to `QUEUE_SHUTDOWN_TIMEOUT_MS` for active work. The adapter boundary remains suitable for a future Redis, SQS, RabbitMQ, or BullMQ scheduler. Upload requests never wait for AI completion; the UI polls active jobs.
+`QUEUE_BACKEND=local` means the scheduler runs inside a process, while job state and leases live in the repository. Local development uses `PROCESS_ROLE=api-and-worker`. Staging and closed pilot require separate `api` and `worker` processes; the API enqueues without claiming, and workers poll PostgreSQL. PostgreSQL uses `FOR UPDATE SKIP LOCKED`, partial claim indexes, compare-and-set lease completion, heartbeats, stale-lease recovery, bounded retries, and dead-letter state. Multiple workers cannot successfully own the same lease. Graceful shutdown stops new claims and waits up to `QUEUE_SHUTDOWN_TIMEOUT_MS` for active work. The adapter boundary remains suitable for a future Redis, SQS, RabbitMQ, or BullMQ scheduler.
 
 ## Malware Scanning
 
-Scanning is an adapter boundary rather than a fake antivirus claim. The development mock can produce clean/suspicious outcomes for tests. The production-capable `clamav` provider streams bounded file bytes to a ClamAV-compatible daemon using `INSTREAM`, maps clean/suspicious results, and enforces `MALWARE_SCAN_TIMEOUT_MS`. Disabled scanning records `scan_unavailable`. Suspicious evidence remains quarantined in private storage and is blocked from AI processing and authenticated download. Scan events are audit logged.
+Scanning is an adapter boundary rather than a fake antivirus claim. The development mock can produce clean/suspicious outcomes for tests. The production-capable `clamav` provider streams bounded file bytes to a ClamAV-compatible daemon using `INSTREAM`, maps clean/suspicious results, and enforces `CLAMAV_TIMEOUT_MS`. Disabled scanning records `scan_unavailable`. Suspicious evidence remains quarantined in private storage and is blocked from AI processing and authenticated download. Scan events are audit logged.
 
 `MALWARE_SCAN_FAIL_POLICY=closed` blocks processing when scanning fails or is unavailable; `open` is intended only for controlled non-production use. `MALWARE_SCAN_REQUIRED_IN_PRODUCTION=true` requires enabled `clamav` scanning and a closed failure policy at startup. ComplianceIQ does not label the development mock as production protection. Deployments must still validate their chosen daemon version, signatures, network policy, scaling, and alerting.
 
@@ -152,7 +156,7 @@ npm test
 For a quick development smoke test without Postgres:
 
 ```bash
-REPOSITORY_BACKEND=file DATABASE_URL= NODE_ENV=development SESSION_SECRET=development-secret-change-me npm run dev
+DEPLOYMENT_PROFILE=local PROCESS_ROLE=api-and-worker REPOSITORY_BACKEND=file DATABASE_URL= NODE_ENV=development SESSION_SECRET=development-secret-change-me npm run dev
 ```
 
 The file repository is only for local development and tests. Production must use Postgres.
@@ -228,11 +232,20 @@ Remove the four `PROVISION_*` values from the deployment environment after the c
 
 ## Running The App
 
-API:
+Local combined API and worker:
 
 ```bash
 npm run dev
 ```
+
+Separate processes:
+
+```bash
+npm run start:api
+npm run start:worker
+```
+
+The API serves `/health/live` and `/health/ready`. A worker-only process serves `/health/live`, `/health/ready`, and `/metrics` on `WORKER_HEALTH_PORT`; keep that port internal.
 
 Web:
 
@@ -256,7 +269,7 @@ npm run build
 To exercise the real Postgres repository adapter, provide a disposable test database URL:
 
 ```bash
-TEST_DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/complianceiq_test npm test
+TEST_DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/complianceiq_test npm run validate:postgres
 ```
 
 The Postgres integration test creates an isolated schema in the supplied database, applies all tracked migrations, writes tenant/user/facility/evidence/job/AI/review/match/gap/action/packet/audit data, restarts the repository, verifies tenant isolation, then drops the schema. It is explicitly skipped unless `TEST_DATABASE_URL` points to disposable infrastructure and the test role can create/drop schemas.
@@ -270,19 +283,44 @@ TEST_S3_ENDPOINT=http://127.0.0.1:9000 \
 TEST_S3_ACCESS_KEY_ID=replace-me \
 TEST_S3_SECRET_ACCESS_KEY=replace-me \
 TEST_S3_FORCE_PATH_STYLE=true \
-npm test
+npm run validate:storage
 ```
 
 The conditional S3 integration uploads an opaque private key, retrieves the bytes through the adapter, creates a server-side bounded 120-second signed URL and verifies its expiry/content, deletes the object, and confirms it is unavailable. The product UI does not expose signed URLs; normal evidence and packet downloads remain authenticated, tenant-scoped backend routes. The test skips clearly unless the required `TEST_S3_*` variables exist.
 
-Browser smoke testing is deterministic and does not use OpenAI:
+Closed-pilot QA is deterministic and does not use OpenAI:
 
 ```bash
 npx playwright install chromium
-npm run test:e2e
+npm run qa:pilot
 ```
 
-Playwright starts isolated file-backed API and web processes, logs in as a local pilot administrator, creates a facility, logs manual evidence, generates a gap matrix/action plan, verifies the reviewer queue, and exports a packet.
+Playwright starts isolated file-backed API and web processes, logs in, creates a facility, uploads evidence, processes it with mock AI, exercises the review queue and human override, verifies matrix/action changes, exports/downloads a packet, archives evidence/packet data, and verifies health endpoints.
+
+Live scanner validation:
+
+```bash
+MALWARE_SCAN_ENABLED=true \
+MALWARE_SCANNER_PROVIDER=clamav \
+MALWARE_SCAN_FAIL_POLICY=closed \
+CLAMAV_HOST=scanner.internal \
+npm run validate:scanner
+```
+
+Live EICAR scanning is opt-in with `SCANNER_VALIDATE_EICAR=true` and should be used only in an approved scanner test environment.
+
+## Synthetic Pilot Dataset
+
+The pilot seed is clearly synthetic, idempotent, and limited to the local profile. It creates one organization; US, Canada, and Mexico facilities; mock AI analyses; a deliberate reviewer-queue item; persisted gap/action data; and generated packet files.
+
+```bash
+DEPLOYMENT_PROFILE=local \
+ENABLE_DEMO_DATA=true \
+ADMIN_PASSWORD='SyntheticPassword#2026' \
+npm run seed:pilot
+```
+
+Do not use the synthetic seed in staging or closed-pilot production.
 
 ## API Summary
 
@@ -353,7 +391,7 @@ Expert review and logs:
 Health:
 
 - `GET /health/live` - process-only liveness; does not call dependencies
-- `GET /health/ready` - database, private storage, queue, and loaded-config readiness
+- `GET /health/ready` - database, private storage, scanner, queue, and loaded-config readiness
 - `GET /health` and `GET /api/health` - readiness aliases for deployment compatibility
 
 ## Security Notes
@@ -416,21 +454,47 @@ The S3-compatible adapter uses the official AWS SDK and supports AWS S3, MinIO, 
 
 ## CI
 
-`.github/workflows/ci.yml` runs `npm ci`, lint, typecheck, self-contained tests, build, prohibited-claim scanning, deterministic-random scanning, and a Chromium Playwright smoke job. PostgreSQL and S3 integration tests use the same suite and remain skipped unless corresponding GitHub secrets are configured. CI does not require OpenAI.
+`.github/workflows/ci.yml` runs `npm ci`, lint, typecheck, self-contained tests, build, prohibited-claim scanning, deterministic-random scanning, and Chromium pilot QA without external secrets. Separate PostgreSQL, S3, and scanner jobs run their validator only when the corresponding secrets are configured; otherwise each reports an explicit skip. CI does not require OpenAI.
+
+## Closed-Pilot Deployment
+
+Deployment profiles are validated at startup:
+
+| Profile | Database / storage | Runtime | Scanner | AI | Security / logging |
+| --- | --- | --- | --- | --- | --- |
+| `local` | File or Postgres; local or S3 | `api-and-worker` by default | Mock, unavailable, or ClamAV; open policy allowed | Disabled or mock/OpenAI | HTTP localhost, Lax cookie, debug/info logs |
+| `staging` | Real Postgres and private S3 required | Separate `api` and `worker` | ClamAV recommended; mock rejected; closed policy recommended | Disabled or OpenAI | HTTPS, strong secret, secure cookie, explicit proxy and info/warn logs |
+| `closed-pilot` | Real Postgres and private S3 required | Separate `api` and `worker` | ClamAV enabled, required, and fail-closed | Disabled or approved OpenAI configuration | HTTPS, strong secret, secure cookie, no demo seed, structured logs |
+
+Templates are available in `deploy/env/local.env.example`, `deploy/env/staging.env.example`, and `deploy/env/closed-pilot.env.example`. Use a secret manager rather than copying secrets into committed files.
+
+Recommended topology:
+
+1. Serve the built static web app from managed HTTPS hosting or a hardened static server/CDN.
+2. Run `npm run start:api` behind the trusted HTTPS ingress.
+3. Run `npm run start:worker` separately with access to PostgreSQL, private storage, scanner, and optional AI provider.
+4. Point both processes at the same migrated PostgreSQL database and private bucket.
+5. Expose API health through the load balancer; keep worker health/metrics internal.
+
+Before handling pilot evidence, run `npm run validate:postgres`, `npm run validate:storage`, `npm run validate:scanner`, and `npm run qa:pilot` in staging. The validators skip clearly when their infrastructure is absent. `VALIDATION_TARGET=production` is refused unless `ALLOW_PRODUCTION_VALIDATION=true`; validators still use isolated data or test objects.
+
+Operational go/no-go, backup/restore, scanner, incident-response, and security checks are in [PILOT_READINESS.md](./PILOT_READINESS.md). Pilot-facing upload and AI limitations are in [PILOT_DATA_POLICY.md](./PILOT_DATA_POLICY.md).
 
 ## Deployment Checklist
 
 - Run `npm ci`
-- Set production environment variables
+- Select and validate the staging or closed-pilot deployment profile
+- Deploy separate API and worker processes
 - Run `npm run db:migrate`
 - Provision the first administrator with `npm run admin:provision`, then remove its `PROVISION_*` secrets
 - Verify `npm test`, `npm run typecheck`, `npm run lint`, and `npm run build`
 - Configure a private S3-compatible bucket for uploads and generated PDFs
 - Configure and validate the `clamav` scanner adapter with current signatures, a closed failure policy, timeout monitoring, and `MALWARE_SCAN_REQUIRED_IN_PRODUCTION=true`; the mock is rejected in production
 - Size queue concurrency, lease, heartbeat, retry, shutdown, database-pool, and AI-provider limits for the pilot workload
-- Run the optional `TEST_DATABASE_URL=... npm test` Postgres integration check against disposable infrastructure
-- Run the optional `TEST_S3_*=... npm test` private-bucket integration check
-- Run `npm run test:e2e` after installing Chromium with Playwright
+- Run `npm run validate:postgres` against disposable/staging infrastructure
+- Run `npm run validate:storage` against the pilot-compatible test bucket
+- Run `npm run validate:scanner` from the deployment network
+- Run `npm run qa:pilot` after installing Chromium with Playwright
 - Confirm CORS allows only trusted web origins
 - Configure TLS termination and set `TRUST_PROXY=true` only when the trusted reverse proxy overwrites forwarding headers
 - Confirm demo data is disabled
@@ -444,7 +508,7 @@ The S3-compatible adapter uses the official AWS SDK and supports AWS S3, MinIO, 
 - Starter rules are demo/unverified unless expert-reviewed.
 - Digitally readable PDF extraction is implemented; encrypted, corrupt, and scanned PDFs fail safely into review.
 - OCR interfaces and test mocks exist, but no production OCR engine is bundled.
-- Queue jobs and leases are durable in PostgreSQL, but scheduling still runs inside API processes. A dedicated external worker/queue remains preferable for independent scaling, back-pressure, and maintenance windows.
+- Queue jobs and leases are durable in PostgreSQL and scheduling can run in a separate worker process. A dedicated external queue service remains preferable for stronger back-pressure and independent scheduler operations.
 - The mock provider is for tests/development only and is rejected in production.
 - A ClamAV-compatible production transport is implemented, but scanner infrastructure, signature freshness, capacity, alerting, and operational approval remain deployment responsibilities.
 - S3-compatible storage is implemented, but bucket policies, customer-managed KMS requirements, legal holds, retention, lifecycle, deletion retry, and restore procedures remain deployment responsibilities.
@@ -468,7 +532,7 @@ The application includes pilot-oriented infrastructure validation paths, but thi
 
 ## Next Recommended Sprint
 
-1. Separate processing into a deployable worker using Redis/SQS/BullMQ while preserving the lease/idempotency repository contract.
-2. Add a production OCR provider with extraction-quality metrics and human-review sampling.
-3. Add scheduled deletion retries, customer retention policies, legal holds, KMS-policy verification, and restore drills.
-4. Add login throttling, account recovery, operational dashboards/alerts, and AI budget controls.
+1. Run the four staging validators and complete the go/no-go checklist with named pilot owners.
+2. Conduct a controlled workflow session with 3–5 EHS/manufacturing users using agreed, minimized pilot data.
+3. Move scheduling to Redis/SQS/BullMQ while preserving the lease/idempotency repository contract.
+4. Add production OCR, scheduled deletion retries, retention/legal holds, login throttling, recovery, monitoring, and AI budget controls.

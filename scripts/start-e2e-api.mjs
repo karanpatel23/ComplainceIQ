@@ -7,6 +7,8 @@ await rm(storagePath, { recursive: true, force: true });
 
 Object.assign(process.env, {
   NODE_ENV: "test",
+  DEPLOYMENT_PROFILE: "local",
+  PROCESS_ROLE: "api-and-worker",
   REPOSITORY_BACKEND: "file",
   FILE_REPOSITORY_PATH: databasePath,
   STORAGE_BACKEND: "local",
@@ -15,8 +17,12 @@ Object.assign(process.env, {
   SESSION_SECRET: "e2e-session-secret-with-enough-length",
   APP_URL: "http://127.0.0.1:5174",
   ALLOWED_ORIGINS: "http://127.0.0.1:5174",
-  AI_ENABLED: "false",
-  MALWARE_SCAN_ENABLED: "false",
+  AI_ENABLED: "true",
+  AI_PROVIDER: "mock",
+  AI_CONFIDENCE_THRESHOLD: "0.8",
+  AI_REVIEW_REQUIRED_THRESHOLD: "0.7",
+  MALWARE_SCAN_ENABLED: "true",
+  MALWARE_SCANNER_PROVIDER: "mock",
   QUEUE_POLL_MS: "250"
 });
 

@@ -4,6 +4,8 @@ import { readConfig, readRepositoryConfig } from "../packages/config/src/index.j
 
 const productionEnv = {
   NODE_ENV: "production",
+  DEPLOYMENT_PROFILE: "staging",
+  PROCESS_ROLE: "api",
   PORT: "4000",
   APP_URL: "https://app.complianceiq.example",
   ALLOWED_ORIGINS: "https://app.complianceiq.example",
@@ -39,6 +41,32 @@ test("production config accepts optional integrations as absent", () => {
   assert.equal(config.databaseUrl, productionEnv.DATABASE_URL);
   assert.equal(config.enableDemoData, false);
   assert.equal(config.storageBackend, "s3");
+  assert.equal(config.deploymentProfile, "staging");
+  assert.equal(config.runsApi, true);
+  assert.equal(config.runsWorker, false);
+});
+
+test("deployment profiles and process roles fail closed outside local development", () => {
+  const local = readConfig({ NODE_ENV: "development", REPOSITORY_BACKEND: "file" });
+  assert.equal(local.deploymentProfile, "local");
+  assert.equal(local.processRole, "api-and-worker");
+  assert.equal(local.runsApi, true);
+  assert.equal(local.runsWorker, true);
+  assert.throws(() => readConfig({ ...productionEnv, DEPLOYMENT_PROFILE: "" }), /DEPLOYMENT_PROFILE/);
+  assert.throws(() => readConfig({ ...productionEnv, PROCESS_ROLE: "" }), /PROCESS_ROLE/);
+  assert.throws(() => readConfig({ ...productionEnv, PROCESS_ROLE: "api-and-worker" }), /limited to local development/);
+  assert.throws(() => readConfig({ ...productionEnv, DEPLOYMENT_PROFILE: "closed-pilot" }), /closed-pilot requires/);
+  const pilot = readConfig({
+    ...productionEnv,
+    DEPLOYMENT_PROFILE: "closed-pilot",
+    PROCESS_ROLE: "worker",
+    MALWARE_SCAN_ENABLED: "true",
+    MALWARE_SCAN_REQUIRED_IN_PRODUCTION: "true",
+    MALWARE_SCANNER_PROVIDER: "clamav",
+    MALWARE_SCAN_FAIL_POLICY: "closed"
+  });
+  assert.equal(pilot.runsApi, false);
+  assert.equal(pilot.runsWorker, true);
 });
 
 test("production storage and malware scanning config fail safely", () => {

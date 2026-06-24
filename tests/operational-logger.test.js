@@ -25,3 +25,12 @@ test("structured operational logs retain correlation fields and redact sensitive
   assert.equal(output.includes("private evidence"), false);
   assert.equal(output.includes("Private Person"), false);
 });
+
+test("structured operational logger honors minimum log level", () => {
+  let output = "";
+  const logger = createOperationalLogger({ level: "warn", sink: { write(value) { output += value; } } });
+  logger.info("ignored", {});
+  logger.warn("retained", { errorCode: "PILOT_WARNING" });
+  assert.equal(output.includes("ignored"), false);
+  assert.equal(JSON.parse(output).event, "retained");
+});

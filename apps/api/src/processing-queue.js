@@ -168,9 +168,10 @@ export class LocalEvidenceProcessingQueue {
     return { drained, activeJobs: this.activeJobs.size };
   }
 
-  async healthCheck() {
+  async healthCheck({ requireWorker = true } = {}) {
     const persisted = await this.repo.getProcessingQueueMetrics?.() || {};
-    return { ok: this.started && !this.stopped, backend: "local", workerId: this.workerId, activeJobs: this.activeJobs.size, persisted, counters: { ...this.counters } };
+    const workerRunning = this.started && !this.stopped;
+    return { ok: requireWorker ? workerRunning : true, backend: "postgres-backed-local-scheduler", workerRunning, workerId: requireWorker ? this.workerId : null, activeJobs: this.activeJobs.size, persisted, counters: { ...this.counters } };
   }
 
   nextLeaseExpiry() {
@@ -198,6 +199,7 @@ export function createEvidenceProcessingQueue(config, dependencies) {
   if (config.queueBackend !== "local") throw new Error(`Unsupported queue backend: ${config.queueBackend}`);
   return new LocalEvidenceProcessingQueue({
     ...dependencies,
+    autoStart: config.runsWorker,
     concurrency: config.queueConcurrency,
     maxRetries: config.queueMaxRetries,
     leaseMs: config.queueLeaseMs,

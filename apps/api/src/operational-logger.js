@@ -1,7 +1,9 @@
 const SENSITIVE_KEY = /(authorization|cookie|secret|password|token|api.?key|prompt|raw|file.?content|document.?text|employee.?names?)/i;
 
-export function createOperationalLogger({ service = "complianceiq-api", sink = process.stderr } = {}) {
+export function createOperationalLogger({ service = "complianceiq-api", sink = process.stderr, level: minimumLevel = "info" } = {}) {
+  const levels = { debug: 10, info: 20, warn: 30, error: 40 };
   const write = (level, event, fields = {}) => {
+    if (levels[level] < levels[minimumLevel]) return;
     const record = sanitize({
       timestamp: new Date().toISOString(),
       level,

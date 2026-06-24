@@ -10,7 +10,15 @@ test("API requires auth and blocks cross-organization access", async () => {
   process.env.REPOSITORY_BACKEND = "file";
   process.env.FILE_REPOSITORY_PATH = path.join(dir, "db.json");
   process.env.UPLOAD_DIR = path.join(dir, "private-storage");
-  process.env.STORAGE_BACKEND = "local";
+  process.env.STORAGE_BACKEND = process.env.API_TEST_USE_S3 === "true" ? "s3" : "local";
+  if (process.env.API_TEST_USE_S3 === "true") {
+    process.env.S3_BUCKET = process.env.TEST_S3_BUCKET;
+    process.env.S3_REGION = process.env.TEST_S3_REGION;
+    process.env.S3_ENDPOINT = process.env.TEST_S3_ENDPOINT || "";
+    process.env.S3_ACCESS_KEY_ID = process.env.TEST_S3_ACCESS_KEY_ID || "";
+    process.env.S3_SECRET_ACCESS_KEY = process.env.TEST_S3_SECRET_ACCESS_KEY || "";
+    process.env.S3_FORCE_PATH_STYLE = process.env.TEST_S3_FORCE_PATH_STYLE || "false";
+  }
   process.env.MAX_UPLOAD_MB = "5";
   process.env.SESSION_SECRET = "test-session-secret-with-enough-length";
   process.env.AI_ENABLED = "true";

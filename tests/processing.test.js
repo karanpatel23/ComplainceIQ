@@ -7,7 +7,7 @@ import { extractEvidenceText, MockOcrProvider } from "../packages/ai/src/index.j
 import { generateAuditPacketPdf } from "../packages/pdf/src/index.js";
 import { FileRepository } from "../packages/db/src/file-repository.js";
 import { parseEvidenceInput, parseFacilityInput } from "../packages/shared/src/index.js";
-import { LocalEvidenceProcessingQueue } from "../apps/api/src/processing-queue.js";
+import { createEvidenceProcessingQueue, LocalEvidenceProcessingQueue } from "../apps/api/src/processing-queue.js";
 import { assertEvidenceDownloadAllowed, canProcessScannedEvidence, ClamAvMalwareScanner, MockMalwareScanner } from "../apps/api/src/malware-scanner.js";
 import { createReviewQueueService } from "../apps/api/src/review-queue-service.js";
 
@@ -102,6 +102,37 @@ test("graceful queue shutdown waits for active work", async () => {
   assert.equal((await repo.getProcessingJob(org.id, running[0].id)).status, "completed");
 });
 
+test("API-only queue persists work without starting a scheduler", async () => {
+  const { repo, org, user, facility } = await setupRepository("api-only-queue");
+  const evidence = await repo.createEvidence(parseEvidenceInput({
+    facilityId: facility.id,
+    title: "API-enqueued record",
+    evidenceType: "other",
+    scanStatus: "scan_clean"
+  }, org.id, user.id));
+  let processed = 0;
+  const queue = createEvidenceProcessingQueue({
+    queueBackend: "local",
+    runsWorker: false,
+    queueConcurrency: 1,
+    queueMaxRetries: 3,
+    queueLeaseMs: 300_000,
+    queueHeartbeatMs: 30_000,
+    queuePollMs: 100,
+    queueShutdownTimeoutMs: 30_000
+  }, {
+    repo,
+    processor: async () => { processed += 1; }
+  });
+
+  await queue.enqueue({ organizationId: org.id, facilityId: facility.id, evidenceId: evidence.id, createdByUserId: user.id });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.equal(processed, 0);
+  assert.equal((await repo.listProcessingJobs(org.id, facility.id))[0].status, "queued");
+  assert.equal((await queue.healthCheck({ requireWorker: false })).workerRunning, false);
+});
+
 test("PDF extraction succeeds, truncates safely, and corrupt or scanned files fail safely", async () => {
   const pdf = generateAuditPacketPdf(packetFixture());
   const extracted = await extractEvidenceText({ buffer: pdf, fileName: "packet.pdf", evidence: { title: "Packet" }, maxChars: 180, maxBytes: 1_000_000 });
@@ -139,6 +170,7 @@ test("malware scanning supports clean processing and blocks suspicious downloads
 test("ClamAV adapter maps clean, suspicious, failure, and timeout-style provider errors", async () => {
   const clean = new ClamAvMalwareScanner({ host: "scanner", port: 3310, timeoutMs: 50, transport: async () => "stream: OK" });
   assert.equal((await clean.scanBuffer({ buffer: Buffer.from("safe") })).status, "scan_clean");
+  assert.equal((await clean.healthCheck()).ok, true);
   const suspicious = new ClamAvMalwareScanner({ host: "scanner", port: 3310, timeoutMs: 50, transport: async () => "stream: Eicar-Test-Signature FOUND" });
   assert.equal((await suspicious.scanBuffer({ buffer: Buffer.from("unsafe") })).status, "scan_suspicious");
   const failed = new ClamAvMalwareScanner({ host: "scanner", port: 3310, timeoutMs: 50, transport: async () => { const error = new Error("timeout"); error.code = "MALWARE_SCANNER_TIMEOUT"; throw error; } });

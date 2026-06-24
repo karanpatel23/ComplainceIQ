@@ -17,7 +17,7 @@ import { validateUploadedFile } from "./file-validation.js";
 import { createOperationalLogger } from "./operational-logger.js";
 
 const config = readConfig(process.env);
-const logger = createOperationalLogger();
+const logger = createOperationalLogger({ service: `complianceiq-${config.processRole}`, level: config.logLevel });
 const repo = await createRepository(config);
 const storage = createPrivateStorage(config);
 const aiProvider = createEvidenceAiProvider(config);
@@ -59,7 +59,7 @@ const processingQueue = createEvidenceProcessingQueue(config, {
     metadata: { evidenceId: job.evidenceId, processingAttempts: job.processingAttempts, ...metadata }
   })
 });
-await processingQueue.start();
+if (config.runsWorker) await processingQueue.start();
 const DEFAULT_JSON_LIMIT_BYTES = 1024 * 1024;
 const UPLOAD_JSON_LIMIT_BYTES = Math.ceil(config.maxUploadMb * 1024 * 1024 * 4 / 3) + 256 * 1024;
 
@@ -96,6 +96,18 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+const workerHealthServer = http.createServer(async (req, res) => {
+  applySecurityHeaders(res);
+  const path = new URL(req.url || "/", "http://localhost").pathname.replace(/\/$/, "") || "/";
+  if (req.method === "GET" && path === "/health/live") return sendJson(res, { status: 200, body: { ok: true, service: "ComplianceIQ Worker", processRole: config.processRole } });
+  if (req.method === "GET" && ["/health", "/health/ready"].includes(path)) return readiness(res, { service: "ComplianceIQ Worker", requireWorker: true });
+  if (req.method === "GET" && path === "/metrics") {
+    const queue = await processingQueue.healthCheck({ requireWorker: true });
+    return sendJson(res, { status: queue.ok ? 200 : 503, body: { service: "ComplianceIQ Worker", processRole: config.processRole, queue } });
+  }
+  return sendJson(res, { status: 404, body: { error: "Route not found", code: "NOT_FOUND" } });
+});
+
 async function handleRequest(req, res) {
   applySecurityHeaders(res);
   applyCors(req, res);
@@ -111,8 +123,8 @@ async function handleRequest(req, res) {
   const method = req.method || "GET";
   req.context.route = path;
 
-  if (method === "GET" && path === "/health/live") return sendJson(res, { status: 200, body: { ok: true, service: "ComplianceIQ API" } });
-  if (method === "GET" && ["/health", "/health/ready", "/api/health"].includes(path)) return readiness(res);
+  if (method === "GET" && path === "/health/live") return sendJson(res, { status: 200, body: { ok: true, service: "ComplianceIQ API", processRole: config.processRole } });
+  if (method === "GET" && ["/health", "/health/ready", "/api/health"].includes(path)) return readiness(res, { service: "ComplianceIQ API", requireWorker: config.runsWorker });
 
   if (method === "POST" && path === "/api/auth/login") return login(req, res);
   if (method === "POST" && path === "/api/auth/logout") return logout(req, res);
@@ -647,12 +659,13 @@ async function archivePacket(req, res, user, id) {
   sendJson(res, { status: 200, body: archived });
 }
 
-async function readiness(res) {
+async function readiness(res, { service, requireWorker }) {
   const checks = {};
   for (const [name, check] of [
     ["persistence", () => repo.healthCheck()],
     ["storage", () => storage.healthCheck()],
-    ["queue", () => processingQueue.healthCheck()]
+    ["scanner", () => malwareScanner.healthCheck()],
+    ["queue", () => processingQueue.healthCheck({ requireWorker })]
   ]) {
     try {
       checks[name] = await check();
@@ -661,7 +674,7 @@ async function readiness(res) {
     }
   }
   const ok = Object.values(checks).every((check) => check.ok);
-  sendJson(res, { status: ok ? 200 : 503, body: { ok, service: "ComplianceIQ API", config: { loaded: true }, ...checks } });
+  sendJson(res, { status: ok ? 200 : 503, body: { ok, service, processRole: config.processRole, deploymentProfile: config.deploymentProfile, config: { loaded: true }, ...checks } });
 }
 
 async function requestExpertReview(req, res, user) {
@@ -890,19 +903,43 @@ function decodeBase64(value) {
 }
 
 if (process.env.NODE_ENV !== "test") {
-  server.listen(config.port, config.apiHost, () => {
-    logger.info("api_listening", { host: config.apiHost, port: config.port });
-  });
-  const shutdown = () => server.close(async () => {
+  if (config.runsApi) {
+    server.listen(config.port, config.apiHost, () => {
+      logger.info("api_listening", { host: config.apiHost, port: config.port, processRole: config.processRole, deploymentProfile: config.deploymentProfile });
+    });
+  }
+  if (config.processRole === "worker") {
+    workerHealthServer.listen(config.workerHealthPort, config.workerHealthHost, () => {
+      logger.info("worker_listening", { host: config.workerHealthHost, port: config.workerHealthPort, processRole: config.processRole, deploymentProfile: config.deploymentProfile });
+    });
+  }
+  let shuttingDown = false;
+  const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    await Promise.all([
+      config.runsApi ? closeServer(server) : Promise.resolve(),
+      config.processRole === "worker" ? closeServer(workerHealthServer) : Promise.resolve()
+    ]);
     const queueShutdown = await processingQueue.stop({ timeoutMs: config.queueShutdownTimeoutMs });
-    logger.info("api_shutdown", { queueDrained: queueShutdown.drained, activeJobs: queueShutdown.activeJobs });
+    logger.info("process_shutdown", { processRole: config.processRole, queueDrained: queueShutdown.drained, activeJobs: queueShutdown.activeJobs });
     await repo.close?.();
     process.exit(0);
-  });
+  };
   process.once("SIGTERM", shutdown);
   process.once("SIGINT", shutdown);
 }
 
 server.on("close", () => void processingQueue.stop());
+workerHealthServer.on("close", () => {
+  if (config.processRole === "worker") void processingQueue.stop();
+});
 
-export { server, repo, processingQueue, malwareScanner, storage, logger };
+function closeServer(instance) {
+  return new Promise((resolve) => {
+    if (!instance.listening) return resolve();
+    instance.close(resolve);
+  });
+}
+
+export { server, workerHealthServer, repo, processingQueue, malwareScanner, storage, logger, config };

@@ -26,16 +26,30 @@ export function readRepositoryConfig(env = process.env) {
 export function readConfig(env = process.env) {
   const repositoryConfig = readRepositoryConfig(env);
   const { nodeEnv, isProduction, repositoryBackend } = repositoryConfig;
+  const deploymentProfile = env.DEPLOYMENT_PROFILE || (isProduction ? "" : "local");
+  if (!["local", "staging", "closed-pilot"].includes(deploymentProfile)) {
+    throw new Error("DEPLOYMENT_PROFILE must be local, staging, or closed-pilot and must be explicit in production");
+  }
+  const isSecureDeployment = deploymentProfile !== "local";
+  if (isSecureDeployment && !isProduction) throw new Error(`${deploymentProfile} requires NODE_ENV=production`);
+  if (isProduction && deploymentProfile === "local") throw new Error("DEPLOYMENT_PROFILE=local is not allowed in production");
+  const processRole = env.PROCESS_ROLE || (deploymentProfile === "local" ? "api-and-worker" : "");
+  if (!["api", "worker", "api-and-worker"].includes(processRole)) {
+    throw new Error("PROCESS_ROLE must be api, worker, or api-and-worker and must be explicit outside local development");
+  }
+  if (isSecureDeployment && processRole === "api-and-worker") {
+    throw new Error("PROCESS_ROLE=api-and-worker is limited to local development; deploy separate api and worker processes");
+  }
   const allowedOrigins = (env.ALLOWED_ORIGINS || "http://localhost:5173,http://localhost:4000")
     .split(",")
     .map((origin) => origin.trim())
     .filter(Boolean);
 
-  if (isProduction) {
-    const required = ["PORT", "APP_URL", "ALLOWED_ORIGINS", "DATABASE_URL", "SESSION_SECRET", "STORAGE_BACKEND", "MAX_UPLOAD_MB"];
+  if (isSecureDeployment) {
+    const required = ["DEPLOYMENT_PROFILE", "PROCESS_ROLE", "PORT", "APP_URL", "ALLOWED_ORIGINS", "DATABASE_URL", "SESSION_SECRET", "STORAGE_BACKEND", "MAX_UPLOAD_MB"];
     const missing = required.filter((name) => !env[name]);
     if (missing.length > 0) {
-      throw new Error(`Missing required production environment variables: ${missing.join(", ")}`);
+      throw new Error(`Missing required ${deploymentProfile} environment variables: ${missing.join(", ")}`);
     }
   }
 
@@ -45,11 +59,11 @@ export function readConfig(env = process.env) {
     throw new Error("PORT must be an integer between 1 and 65535");
   }
 
-  if (isProduction && allowedOrigins.includes("*")) {
+  if (isSecureDeployment && allowedOrigins.includes("*")) {
     throw new Error("ALLOWED_ORIGINS must not include * in production");
   }
 
-  if (isProduction) {
+  if (isSecureDeployment) {
     try {
       const appUrl = new URL(env.APP_URL);
       const originUrls = allowedOrigins.map((origin) => new URL(origin));
@@ -59,11 +73,11 @@ export function readConfig(env = process.env) {
     }
   }
 
-  if (isProduction && (!env.SESSION_SECRET || env.SESSION_SECRET.length < 32)) {
+  if (isSecureDeployment && (!env.SESSION_SECRET || env.SESSION_SECRET.length < 32)) {
     throw new Error("SESSION_SECRET is required in production and must be at least 32 characters");
   }
 
-  if (isProduction && env.ENABLE_DEMO_DATA === "true") {
+  if (isSecureDeployment && env.ENABLE_DEMO_DATA === "true") {
     throw new Error("ENABLE_DEMO_DATA must not be true in production");
   }
 
@@ -74,7 +88,7 @@ export function readConfig(env = process.env) {
 
   const storageBackend = env.STORAGE_BACKEND || env.UPLOAD_STORAGE_BACKEND || "local";
   if (!["local", "s3"].includes(storageBackend)) throw new Error("STORAGE_BACKEND must be local or s3");
-  if (isProduction && storageBackend !== "s3") throw new Error("STORAGE_BACKEND must be s3 in production");
+  if (isSecureDeployment && storageBackend !== "s3") throw new Error(`STORAGE_BACKEND must be s3 for ${deploymentProfile}`);
   if (storageBackend === "s3" && (!env.S3_BUCKET || !env.S3_REGION)) {
     throw new Error("S3_BUCKET and S3_REGION are required when STORAGE_BACKEND=s3");
   }
@@ -95,21 +109,24 @@ export function readConfig(env = process.env) {
   const malwareScanEnabled = env.MALWARE_SCAN_ENABLED === "true";
   const malwareScanRequiredInProduction = env.MALWARE_SCAN_REQUIRED_IN_PRODUCTION === "true";
   const malwareScannerProvider = env.MALWARE_SCANNER_PROVIDER || "mock";
-  const malwareScanTimeoutMs = boundedInteger(env.MALWARE_SCAN_TIMEOUT_MS || "10000", "MALWARE_SCAN_TIMEOUT_MS", 100, 120_000);
-  const malwareScanFailPolicy = env.MALWARE_SCAN_FAIL_POLICY || (isProduction ? "closed" : "open");
+  const malwareScanTimeoutMs = boundedInteger(env.CLAMAV_TIMEOUT_MS || env.MALWARE_SCAN_TIMEOUT_MS || "10000", "CLAMAV_TIMEOUT_MS", 100, 120_000);
+  const malwareScanFailPolicy = env.MALWARE_SCAN_FAIL_POLICY || (isSecureDeployment ? "closed" : "open");
   const clamavHost = env.CLAMAV_HOST || "127.0.0.1";
   const clamavPort = boundedInteger(env.CLAMAV_PORT || "3310", "CLAMAV_PORT", 1, 65_535);
   if (!["mock", "clamav"].includes(malwareScannerProvider)) throw new Error("MALWARE_SCANNER_PROVIDER must be mock or clamav");
   if (!["open", "closed"].includes(malwareScanFailPolicy)) throw new Error("MALWARE_SCAN_FAIL_POLICY must be open or closed");
-  if (isProduction && malwareScanEnabled && malwareScannerProvider === "mock") {
+  if (isSecureDeployment && malwareScanEnabled && malwareScannerProvider === "mock") {
     throw new Error("MALWARE_SCANNER_PROVIDER=mock is not allowed in production");
   }
-  if (isProduction && malwareScanRequiredInProduction && (!malwareScanEnabled || malwareScannerProvider !== "clamav" || malwareScanFailPolicy !== "closed")) {
+  if (isSecureDeployment && malwareScanRequiredInProduction && (!malwareScanEnabled || malwareScannerProvider !== "clamav" || malwareScanFailPolicy !== "closed")) {
     throw new Error("Production-required malware scanning needs an enabled non-mock scanner adapter");
+  }
+  if (deploymentProfile === "closed-pilot" && (!malwareScanEnabled || !malwareScanRequiredInProduction || malwareScannerProvider !== "clamav" || malwareScanFailPolicy !== "closed")) {
+    throw new Error("closed-pilot requires enabled, required, fail-closed ClamAV scanning");
   }
 
   const trustProxy = env.TRUST_PROXY === "true";
-  const sessionCookieSameSite = (env.SESSION_COOKIE_SAME_SITE || (isProduction ? "None" : "Lax")).toLowerCase();
+  const sessionCookieSameSite = (env.SESSION_COOKIE_SAME_SITE || (isSecureDeployment ? "None" : "Lax")).toLowerCase();
   if (!["lax", "strict", "none"].includes(sessionCookieSameSite)) throw new Error("SESSION_COOKIE_SAME_SITE must be Lax, Strict, or None");
 
   const aiEnabled = env.AI_ENABLED === "true";
@@ -123,18 +140,29 @@ export function readConfig(env = process.env) {
   if (aiEnabled && !["openai", "mock"].includes(aiProvider)) {
     throw new Error("AI_PROVIDER must be openai or mock when AI is enabled");
   }
-  if (isProduction && aiEnabled && aiProvider === "mock") {
+  if (isSecureDeployment && aiEnabled && aiProvider === "mock") {
     throw new Error("AI_PROVIDER=mock is not allowed in production");
   }
   if (aiEnabled && aiProvider === "openai" && (!env.OPENAI_API_KEY || !env.OPENAI_MODEL)) {
     throw new Error("OPENAI_API_KEY and OPENAI_MODEL are required when AI_ENABLED=true and AI_PROVIDER=openai");
   }
 
+  const logLevel = env.LOG_LEVEL || "info";
+  if (!["debug", "info", "warn", "error"].includes(logLevel)) throw new Error("LOG_LEVEL must be debug, info, warn, or error");
+
   return {
     nodeEnv,
     isProduction,
+    deploymentProfile,
+    isSecureDeployment,
+    processRole,
+    runsApi: ["api", "api-and-worker"].includes(processRole),
+    runsWorker: ["worker", "api-and-worker"].includes(processRole),
+    logLevel,
     port,
     apiHost: env.API_HOST || (isProduction ? "0.0.0.0" : "127.0.0.1"),
+    workerHealthPort: boundedInteger(env.WORKER_HEALTH_PORT || "4001", "WORKER_HEALTH_PORT", 1, 65_535),
+    workerHealthHost: env.WORKER_HEALTH_HOST || (isProduction ? "0.0.0.0" : "127.0.0.1"),
     appUrl: env.APP_URL || "http://localhost:5173",
     allowedOrigins,
     databaseUrl: repositoryConfig.databaseUrl,

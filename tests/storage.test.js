@@ -82,6 +82,8 @@ test("S3-compatible integration uploads, retrieves, and deletes a private object
     const signedResponse = await fetch(signed);
     assert.equal(signedResponse.ok, true);
     assert.equal(await signedResponse.text(), marker);
+    const publicResponse = await fetch(publicObjectUrl(saved.fileReference), { redirect: "manual", signal: AbortSignal.timeout(10_000) });
+    assert.notEqual(publicResponse.status, 200, "Test object is publicly readable without authorization");
   } finally {
     await storage.deleteBuffer(saved.fileReference);
   }
@@ -91,4 +93,19 @@ test("S3-compatible integration uploads, retrieves, and deletes a private object
 function hasS3IntegrationConfig() {
   return Boolean(process.env.TEST_S3_BUCKET && process.env.TEST_S3_REGION
     && process.env.TEST_S3_ACCESS_KEY_ID && process.env.TEST_S3_SECRET_ACCESS_KEY);
+}
+
+function publicObjectUrl(fileReference) {
+  const encodedKey = fileReference.split("/").map(encodeURIComponent).join("/");
+  if (process.env.TEST_S3_ENDPOINT) {
+    const endpoint = new URL(process.env.TEST_S3_ENDPOINT);
+    if (process.env.TEST_S3_FORCE_PATH_STYLE === "true") {
+      endpoint.pathname = `${endpoint.pathname.replace(/\/$/, "")}/${encodeURIComponent(process.env.TEST_S3_BUCKET)}/${encodedKey}`;
+    } else {
+      endpoint.hostname = `${process.env.TEST_S3_BUCKET}.${endpoint.hostname}`;
+      endpoint.pathname = `${endpoint.pathname.replace(/\/$/, "")}/${encodedKey}`;
+    }
+    return endpoint.toString();
+  }
+  return `https://${process.env.TEST_S3_BUCKET}.s3.${process.env.TEST_S3_REGION}.amazonaws.com/${encodedKey}`;
 }

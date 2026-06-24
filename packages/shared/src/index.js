@@ -162,6 +162,9 @@ export function parseEvidenceInput(input, organizationId, uploadedByUserId) {
     fileReference: optionalString(input.fileReference),
     fileName: optionalString(input.fileName),
     contentType: optionalString(input.contentType),
+    detectedContentType: optionalString(input.detectedContentType),
+    fileValidationStatus: optionalString(input.fileValidationStatus) || (input.fileReference ? "legacy_unverified" : "not_applicable"),
+    fileValidationError: optionalString(input.fileValidationError),
     fileSizeBytes: optionalInteger(input.fileSizeBytes),
     fileSha256: optionalString(input.fileSha256),
     scanStatus: normalizeEnum(input.scanStatus ?? "scan_unavailable", FILE_SCAN_STATUSES, "scanStatus"),
@@ -177,7 +180,13 @@ export function parseEvidenceInput(input, organizationId, uploadedByUserId) {
     status: normalizeEvidenceStatus(input.status ?? "pending"),
     confidence: normalizeConfidence(input.confidence ?? "medium"),
     reviewerNotes: optionalString(input.reviewerNotes),
-    archived: Boolean(input.archived ?? false)
+    archived: Boolean(input.archived ?? false),
+    deletedAt: optionalString(input.deletedAt),
+    deletedByUserId: optionalString(input.deletedByUserId),
+    deletionReason: optionalString(input.deletionReason),
+    retentionUntil: optionalString(input.retentionUntil),
+    storageDeletionStatus: optionalString(input.storageDeletionStatus) || (input.fileReference ? "retained" : "not_applicable"),
+    storageDeletionError: optionalString(input.storageDeletionError)
   };
 }
 

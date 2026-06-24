@@ -51,6 +51,19 @@ export class FileRepository {
   normalizeLegacyData() {
     for (const evidence of this.data.evidence) {
       if (!evidence.scanStatus) evidence.scanStatus = "scan_unavailable";
+      evidence.fileValidationStatus ||= evidence.fileReference ? "legacy_unverified" : "not_applicable";
+      evidence.storageDeletionStatus ||= evidence.fileReference ? "retained" : "not_applicable";
+    }
+    for (const packet of this.data.auditPackets) {
+      packet.archived ??= false;
+      packet.storageDeletionStatus ||= packet.fileReference ? "retained" : "deleted";
+    }
+    for (const job of this.data.processingJobs) {
+      job.workerId ??= null;
+      job.leaseToken ??= null;
+      job.leaseExpiresAt ??= null;
+      job.heartbeatAt ??= null;
+      job.deadLetteredAt ??= null;
     }
     const byEvidence = new Map();
     for (const analysis of this.data.evidenceAiAnalyses) {
@@ -205,8 +218,9 @@ export class FileRepository {
     return row;
   }
 
-  async archiveEvidence(organizationId, id) {
-    return this.updateEvidence(organizationId, id, { archived: true });
+  async archiveEvidence(organizationId, id, deletion = {}) {
+    if (deletion.deletedByUserId) await this.assertUserOrganization(deletion.deletedByUserId, organizationId, "Deletion actor");
+    return this.updateEvidence(organizationId, id, { archived: true, ...deletion });
   }
 
   async upsertAiAnalysis(input) {
@@ -316,7 +330,7 @@ export class FileRepository {
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
 
-  async claimNextProcessingJob() {
+  async claimNextProcessingJob({ workerId = `worker-${process.pid}`, leaseToken = this.createId(), leaseExpiresAt = new Date(Date.now() + 300_000).toISOString() } = {}) {
     const now = Date.now();
     const job = this.data.processingJobs
       .filter((row) => row.status === "queued" && (!row.nextRetryAt || new Date(row.nextRetryAt).getTime() <= now))
@@ -327,44 +341,76 @@ export class FileRepository {
       processingAttempts: job.processingAttempts + 1,
       processingStartedAt: nowIso(),
       nextRetryAt: null,
+      workerId,
+      leaseToken,
+      leaseExpiresAt,
+      heartbeatAt: nowIso(),
       updatedAt: nowIso()
     });
     await this.persist();
-    return job;
+    return { ...job };
   }
 
-  async recoverStaleProcessingJobs(staleBefore) {
+  async heartbeatProcessingJob(organizationId, id, { leaseToken, leaseExpiresAt }) {
+    const job = await this.getProcessingJob(organizationId, id);
+    if (job.status !== "processing" || job.leaseToken !== leaseToken) throw leaseLostError(id);
+    Object.assign(job, { heartbeatAt: nowIso(), leaseExpiresAt, updatedAt: nowIso() });
+    await this.persist();
+    return { ...job };
+  }
+
+  async recoverStaleProcessingJobs(expiredBefore = nowIso()) {
     let changed = false;
+    const recovered = [];
     for (const job of this.data.processingJobs) {
-      if (job.status !== "processing" || !job.processingStartedAt || job.processingStartedAt >= staleBefore) continue;
-      job.status = job.processingAttempts < job.maxAttempts ? "queued" : "failed";
-      job.lastProcessingError = "Recovered after an interrupted worker process.";
+      const leaseBoundary = job.leaseExpiresAt || job.processingStartedAt;
+      if (job.status !== "processing" || !leaseBoundary || leaseBoundary >= expiredBefore) continue;
+      job.status = job.processingAttempts < job.maxAttempts ? "queued" : "dead_letter";
+      job.lastProcessingError = "Recovered after an expired worker lease.";
       job.nextRetryAt = null;
-      job.processingCompletedAt = job.status === "failed" ? nowIso() : null;
+      job.processingCompletedAt = job.status === "dead_letter" ? nowIso() : null;
+      job.deadLetteredAt = job.status === "dead_letter" ? nowIso() : null;
+      job.workerId = null;
+      job.leaseToken = null;
+      job.leaseExpiresAt = null;
+      job.heartbeatAt = null;
       job.updatedAt = nowIso();
       changed = true;
+      recovered.push({ ...job });
     }
     if (changed) await this.persist();
+    return recovered;
   }
 
-  async completeProcessingJob(organizationId, id) {
+  async completeProcessingJob(organizationId, id, leaseToken) {
     const job = await this.getProcessingJob(organizationId, id);
-    Object.assign(job, { status: "completed", processingCompletedAt: nowIso(), lastProcessingError: null, updatedAt: nowIso() });
+    if (job.status !== "processing" || job.leaseToken !== leaseToken) throw leaseLostError(id);
+    Object.assign(job, { status: "completed", processingCompletedAt: nowIso(), lastProcessingError: null, workerId: null, leaseToken: null, leaseExpiresAt: null, heartbeatAt: null, updatedAt: nowIso() });
     await this.persist();
-    return job;
+    return { ...job };
   }
 
-  async failProcessingJob(organizationId, id, { error, retryAt = null }) {
+  async failProcessingJob(organizationId, id, { error, retryAt = null, leaseToken }) {
     const job = await this.getProcessingJob(organizationId, id);
+    if (job.status !== "processing" || job.leaseToken !== leaseToken) throw leaseLostError(id);
     Object.assign(job, {
-      status: retryAt ? "queued" : "failed",
+      status: retryAt ? "queued" : "dead_letter",
       lastProcessingError: String(error || "Processing failed").slice(0, 500),
       nextRetryAt: retryAt,
       processingCompletedAt: retryAt ? null : nowIso(),
+      deadLetteredAt: retryAt ? null : nowIso(),
+      workerId: null,
+      leaseToken: null,
+      leaseExpiresAt: null,
+      heartbeatAt: null,
       updatedAt: nowIso()
     });
     await this.persist();
-    return job;
+    return { ...job };
+  }
+
+  async getProcessingQueueMetrics() {
+    return this.data.processingJobs.reduce((metrics, job) => ({ ...metrics, [job.status]: (metrics[job.status] || 0) + 1 }), {});
   }
 
   async applyAiHumanReview(input) {
@@ -504,18 +550,27 @@ export class FileRepository {
     const review = await this.getReview(input.organizationId, input.reviewId);
     if (review.facilityId !== facility.id) throw forbidden("Review does not belong to this facility");
     if (input.rulesPackId !== review.rulesPackId) throw forbidden("Packet rules pack does not match the review rules pack");
-    const row = { id: input.id || this.createId(), generatedAt: nowIso(), ...input };
+    const row = { id: input.id || this.createId(), generatedAt: nowIso(), archived: false, storageDeletionStatus: "retained", ...input };
     this.data.auditPackets.push(row);
     await this.persist();
     return row;
   }
 
   async listAuditPackets(organizationId, facilityId = null) {
-    return this.data.auditPackets.filter((row) => row.organizationId === organizationId && (!facilityId || row.facilityId === facilityId));
+    return this.data.auditPackets.filter((row) => row.organizationId === organizationId && !row.archived && (!facilityId || row.facilityId === facilityId));
   }
 
   async getAuditPacket(organizationId, id) {
     return this.getScoped("auditPackets", organizationId, id, "Audit packet");
+  }
+
+  async archiveAuditPacket(organizationId, id, deletion = {}) {
+    const row = await this.getAuditPacket(organizationId, id);
+    if (deletion.deletedByUserId) await this.assertUserOrganization(deletion.deletedByUserId, organizationId, "Deletion actor");
+    Object.assign(row, { archived: deletion.archived ?? true, ...deletion });
+    if (row.storageDeletionStatus === "deleted") row.fileReference = null;
+    await this.persist();
+    return row;
   }
 
   async createExpertReview(input) {
@@ -552,10 +607,23 @@ export class FileRepository {
     return this.data.auditLogs.filter((row) => row.organizationId === organizationId && (!facilityId || row.facilityId === facilityId));
   }
 
+  async assertUserOrganization(userId, organizationId, label = "User") {
+    const user = await this.findUserById(userId);
+    if (!user || user.organizationId !== organizationId) throw forbidden(`${label} does not belong to this organization`);
+    return user;
+  }
+
   async getScoped(table, organizationId, id, label) {
     const row = this.data[table].find((item) => item.id === id);
     if (!row) return null;
     if (row.organizationId !== organizationId) throw forbidden(`${label} belongs to another organization`);
     return row;
   }
+}
+
+function leaseLostError(id) {
+  const error = new Error(`Processing job lease was lost for ${id}`);
+  error.code = "JOB_LEASE_LOST";
+  error.retryable = false;
+  return error;
 }

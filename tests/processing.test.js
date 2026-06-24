@@ -8,7 +8,7 @@ import { generateAuditPacketPdf } from "../packages/pdf/src/index.js";
 import { FileRepository } from "../packages/db/src/file-repository.js";
 import { parseEvidenceInput, parseFacilityInput } from "../packages/shared/src/index.js";
 import { LocalEvidenceProcessingQueue } from "../apps/api/src/processing-queue.js";
-import { assertEvidenceDownloadAllowed, canProcessScannedEvidence, MockMalwareScanner } from "../apps/api/src/malware-scanner.js";
+import { assertEvidenceDownloadAllowed, canProcessScannedEvidence, ClamAvMalwareScanner, MockMalwareScanner } from "../apps/api/src/malware-scanner.js";
 import { createReviewQueueService } from "../apps/api/src/review-queue-service.js";
 
 test("local queue is idempotent and retries failed jobs within the configured bound", async () => {
@@ -50,6 +50,58 @@ test("local queue is idempotent and retries failed jobs within the configured bo
   assert.equal(calls, 2);
 });
 
+test("worker leases heartbeat, recover stale jobs, and reject stale completion", async () => {
+  const { repo, org, user, facility } = await setupRepository("leases");
+  const evidence = await repo.createEvidence(parseEvidenceInput({ facilityId: facility.id, title: "Lease record", evidenceType: "other", scanStatus: "scan_clean" }, org.id, user.id));
+  await repo.enqueueProcessingJob({ organizationId: org.id, facilityId: facility.id, evidenceId: evidence.id, createdByUserId: user.id, maxAttempts: 3 });
+  const first = await repo.claimNextProcessingJob({ workerId: "worker-a", leaseToken: "lease-a", leaseExpiresAt: new Date(Date.now() - 1_000).toISOString() });
+  const recovered = await repo.recoverStaleProcessingJobs(new Date().toISOString());
+  assert.equal(recovered[0].status, "queued");
+  const second = await repo.claimNextProcessingJob({ workerId: "worker-b", leaseToken: "lease-b", leaseExpiresAt: new Date(Date.now() + 60_000).toISOString() });
+  assert.equal(second.id, first.id);
+  await assert.rejects(() => repo.completeProcessingJob(org.id, first.id, first.leaseToken), (error) => error.code === "JOB_LEASE_LOST");
+  await repo.heartbeatProcessingJob(org.id, second.id, { leaseToken: second.leaseToken, leaseExpiresAt: new Date(Date.now() + 120_000).toISOString() });
+  assert.ok((await repo.getProcessingJob(org.id, second.id)).heartbeatAt);
+  assert.equal((await repo.completeProcessingJob(org.id, second.id, second.leaseToken)).status, "completed");
+});
+
+test("expired final-attempt jobs enter dead letter and two workers do not process one job twice", async () => {
+  const { repo, org, user, facility } = await setupRepository("dead-letter");
+  const evidence = await repo.createEvidence(parseEvidenceInput({ facilityId: facility.id, title: "Dead-letter record", evidenceType: "other", scanStatus: "scan_clean" }, org.id, user.id));
+  await repo.enqueueProcessingJob({ organizationId: org.id, facilityId: facility.id, evidenceId: evidence.id, createdByUserId: user.id, maxAttempts: 1 });
+  await repo.claimNextProcessingJob({ workerId: "worker-a", leaseToken: "lease-final", leaseExpiresAt: new Date(Date.now() - 1_000).toISOString() });
+  assert.equal((await repo.recoverStaleProcessingJobs(new Date().toISOString()))[0].status, "dead_letter");
+
+  const secondEvidence = await repo.createEvidence(parseEvidenceInput({ facilityId: facility.id, title: "Concurrent record", evidenceType: "other", scanStatus: "scan_clean" }, org.id, user.id));
+  let calls = 0;
+  const processor = async () => { calls += 1; return { id: "analysis-concurrent" }; };
+  const queueA = new LocalEvidenceProcessingQueue({ repo, processor, autoStart: false, workerId: "queue-a" });
+  const queueB = new LocalEvidenceProcessingQueue({ repo, processor, autoStart: false, workerId: "queue-b" });
+  await queueA.enqueue({ organizationId: org.id, facilityId: facility.id, evidenceId: secondEvidence.id, createdByUserId: user.id });
+  await Promise.all([queueA.drain(), queueB.drain()]);
+  assert.equal(calls, 1);
+  assert.equal((await repo.listProcessingJobs(org.id, facility.id)).find((job) => job.evidenceId === secondEvidence.id).status, "completed");
+});
+
+test("graceful queue shutdown waits for active work", async () => {
+  const { repo, org, user, facility } = await setupRepository("shutdown");
+  const evidence = await repo.createEvidence(parseEvidenceInput({ facilityId: facility.id, title: "Shutdown record", evidenceType: "other", scanStatus: "scan_clean" }, org.id, user.id));
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const queue = new LocalEvidenceProcessingQueue({ repo, autoStart: false, workerId: "shutdown-worker", heartbeatMs: 5, leaseMs: 50, processor: async () => { await gate; return { id: "analysis-shutdown" }; } });
+  await queue.enqueue({ organizationId: org.id, facilityId: facility.id, evidenceId: evidence.id, createdByUserId: user.id });
+  const drain = queue.drain();
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  const running = await repo.listProcessingJobs(org.id, facility.id);
+  assert.equal(running[0].status, "processing");
+  assert.ok(running[0].heartbeatAt);
+  const stopping = queue.stop({ timeoutMs: 500 });
+  release();
+  assert.equal((await stopping).drained, true);
+  await drain;
+  assert.equal((await repo.getProcessingJob(org.id, running[0].id)).status, "completed");
+});
+
 test("PDF extraction succeeds, truncates safely, and corrupt or scanned files fail safely", async () => {
   const pdf = generateAuditPacketPdf(packetFixture());
   const extracted = await extractEvidenceText({ buffer: pdf, fileName: "packet.pdf", evidence: { title: "Packet" }, maxChars: 180, maxBytes: 1_000_000 });
@@ -77,8 +129,20 @@ test("malware scanning supports clean processing and blocks suspicious downloads
   const suspicious = await suspiciousScanner.scanBuffer({ buffer: Buffer.from("unsafe") });
   assert.equal(suspicious.status, "scan_suspicious");
   assert.throws(() => assertEvidenceDownloadAllowed({ scanStatus: suspicious.status }), /blocked/);
+  assert.throws(() => assertEvidenceDownloadAllowed({ scanStatus: "scan_failed", fileReference: "private/file.txt" }, { malwareScanFailPolicy: "closed" }), (error) => error.code === "FILE_BLOCKED_SCAN_INCOMPLETE");
   assert.equal(canProcessScannedEvidence({ scanStatus: "scan_unavailable" }, { isProduction: false, malwareScanRequiredInProduction: false }), true);
   assert.equal(canProcessScannedEvidence({ scanStatus: "scan_unavailable" }, { isProduction: true, malwareScanRequiredInProduction: false }), false);
+  assert.equal(canProcessScannedEvidence({ scanStatus: "scan_failed" }, { malwareScanFailPolicy: "open", malwareScanRequiredInProduction: false }), true);
+  assert.equal(canProcessScannedEvidence({ scanStatus: "scan_failed" }, { malwareScanFailPolicy: "closed", malwareScanRequiredInProduction: false }), false);
+});
+
+test("ClamAV adapter maps clean, suspicious, failure, and timeout-style provider errors", async () => {
+  const clean = new ClamAvMalwareScanner({ host: "scanner", port: 3310, timeoutMs: 50, transport: async () => "stream: OK" });
+  assert.equal((await clean.scanBuffer({ buffer: Buffer.from("safe") })).status, "scan_clean");
+  const suspicious = new ClamAvMalwareScanner({ host: "scanner", port: 3310, timeoutMs: 50, transport: async () => "stream: Eicar-Test-Signature FOUND" });
+  assert.equal((await suspicious.scanBuffer({ buffer: Buffer.from("unsafe") })).status, "scan_suspicious");
+  const failed = new ClamAvMalwareScanner({ host: "scanner", port: 3310, timeoutMs: 50, transport: async () => { const error = new Error("timeout"); error.code = "MALWARE_SCANNER_TIMEOUT"; throw error; } });
+  await assert.rejects(() => failed.scanBuffer({ buffer: Buffer.from("unknown") }), (error) => error.code === "MALWARE_SCANNER_TIMEOUT");
 });
 
 test("review queue filters by tenant, facility, status, and priority impact", async () => {

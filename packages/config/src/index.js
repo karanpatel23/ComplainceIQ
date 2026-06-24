@@ -51,10 +51,11 @@ export function readConfig(env = process.env) {
 
   if (isProduction) {
     try {
-      new URL(env.APP_URL);
-      for (const origin of allowedOrigins) new URL(origin);
+      const appUrl = new URL(env.APP_URL);
+      const originUrls = allowedOrigins.map((origin) => new URL(origin));
+      if (appUrl.protocol !== "https:" || originUrls.some((origin) => origin.protocol !== "https:")) throw new Error("HTTPS required");
     } catch {
-      throw new Error("APP_URL and ALLOWED_ORIGINS must contain valid absolute URLs in production");
+      throw new Error("APP_URL and ALLOWED_ORIGINS must contain valid absolute HTTPS URLs in production");
     }
   }
 
@@ -85,17 +86,31 @@ export function readConfig(env = process.env) {
   if (queueBackend !== "local") throw new Error("QUEUE_BACKEND currently supports local only");
   const queueConcurrency = boundedInteger(env.QUEUE_CONCURRENCY || "1", "QUEUE_CONCURRENCY", 1, 16);
   const queueMaxRetries = boundedInteger(env.QUEUE_MAX_RETRIES || "3", "QUEUE_MAX_RETRIES", 1, 10);
+  const queueLeaseMs = boundedInteger(env.QUEUE_LEASE_MS || "300000", "QUEUE_LEASE_MS", 5_000, 3_600_000);
+  const queueHeartbeatMs = boundedInteger(env.QUEUE_HEARTBEAT_MS || "30000", "QUEUE_HEARTBEAT_MS", 1_000, 300_000);
+  const queuePollMs = boundedInteger(env.QUEUE_POLL_MS || "1000", "QUEUE_POLL_MS", 100, 60_000);
+  const queueShutdownTimeoutMs = boundedInteger(env.QUEUE_SHUTDOWN_TIMEOUT_MS || "30000", "QUEUE_SHUTDOWN_TIMEOUT_MS", 1_000, 300_000);
+  if (queueHeartbeatMs >= queueLeaseMs) throw new Error("QUEUE_HEARTBEAT_MS must be less than QUEUE_LEASE_MS");
 
   const malwareScanEnabled = env.MALWARE_SCAN_ENABLED === "true";
   const malwareScanRequiredInProduction = env.MALWARE_SCAN_REQUIRED_IN_PRODUCTION === "true";
   const malwareScannerProvider = env.MALWARE_SCANNER_PROVIDER || "mock";
-  if (malwareScannerProvider !== "mock") throw new Error("MALWARE_SCANNER_PROVIDER currently supports mock only");
+  const malwareScanTimeoutMs = boundedInteger(env.MALWARE_SCAN_TIMEOUT_MS || "10000", "MALWARE_SCAN_TIMEOUT_MS", 100, 120_000);
+  const malwareScanFailPolicy = env.MALWARE_SCAN_FAIL_POLICY || (isProduction ? "closed" : "open");
+  const clamavHost = env.CLAMAV_HOST || "127.0.0.1";
+  const clamavPort = boundedInteger(env.CLAMAV_PORT || "3310", "CLAMAV_PORT", 1, 65_535);
+  if (!["mock", "clamav"].includes(malwareScannerProvider)) throw new Error("MALWARE_SCANNER_PROVIDER must be mock or clamav");
+  if (!["open", "closed"].includes(malwareScanFailPolicy)) throw new Error("MALWARE_SCAN_FAIL_POLICY must be open or closed");
   if (isProduction && malwareScanEnabled && malwareScannerProvider === "mock") {
     throw new Error("MALWARE_SCANNER_PROVIDER=mock is not allowed in production");
   }
-  if (isProduction && malwareScanRequiredInProduction && (!malwareScanEnabled || malwareScannerProvider === "mock")) {
+  if (isProduction && malwareScanRequiredInProduction && (!malwareScanEnabled || malwareScannerProvider !== "clamav" || malwareScanFailPolicy !== "closed")) {
     throw new Error("Production-required malware scanning needs an enabled non-mock scanner adapter");
   }
+
+  const trustProxy = env.TRUST_PROXY === "true";
+  const sessionCookieSameSite = (env.SESSION_COOKIE_SAME_SITE || (isProduction ? "None" : "Lax")).toLowerCase();
+  if (!["lax", "strict", "none"].includes(sessionCookieSameSite)) throw new Error("SESSION_COOKIE_SAME_SITE must be Lax, Strict, or None");
 
   const aiEnabled = env.AI_ENABLED === "true";
   const aiProvider = env.AI_PROVIDER || "openai";
@@ -139,9 +154,19 @@ export function readConfig(env = process.env) {
     queueBackend,
     queueConcurrency,
     queueMaxRetries,
+    queueLeaseMs,
+    queueHeartbeatMs,
+    queuePollMs,
+    queueShutdownTimeoutMs,
     malwareScanEnabled,
     malwareScanRequiredInProduction,
     malwareScannerProvider,
+    malwareScanTimeoutMs,
+    malwareScanFailPolicy,
+    clamavHost,
+    clamavPort,
+    trustProxy,
+    sessionCookieSameSite: sessionCookieSameSite[0].toUpperCase() + sessionCookieSameSite.slice(1),
     enableDemoData: env.ENABLE_DEMO_DATA === "true",
     adminEmail: env.ADMIN_EMAIL || "admin@complianceiq.local",
     adminPassword: env.ADMIN_PASSWORD || "",

@@ -1,7 +1,8 @@
-import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { DeleteObjectCommand, GetObjectCommand, HeadBucketCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
 export class LocalPrivateStorage {
   constructor(config) {
@@ -40,6 +41,12 @@ export class LocalPrivateStorage {
     }
   }
 
+  async healthCheck() {
+    await mkdir(this.uploadDir, { recursive: true, mode: 0o700 });
+    await access(this.uploadDir);
+    return { ok: true, backend: this.backend };
+  }
+
   safePath(fileReference) {
     const abs = path.resolve(this.uploadDir, fileReference);
     const relative = path.relative(this.uploadDir, abs);
@@ -51,10 +58,12 @@ export class LocalPrivateStorage {
 }
 
 export class S3PrivateStorage {
-  constructor(config, client = null) {
+  constructor(config, client = null, presigner = getSignedUrl) {
     this.backend = "s3";
     this.bucket = config.s3Bucket;
     this.maxBytes = config.maxUploadMb * 1024 * 1024;
+    this.signedUrlExpirySeconds = config.signedUrlExpirySeconds || 300;
+    this.presigner = presigner;
     this.client = client || new S3Client({
       region: config.s3Region,
       endpoint: config.s3Endpoint || undefined,
@@ -99,6 +108,18 @@ export class S3PrivateStorage {
     await this.client.send(new DeleteObjectCommand({ Bucket: this.bucket, Key: this.safeKey(fileReference) }));
   }
 
+  async healthCheck() {
+    await this.client.send(new HeadBucketCommand({ Bucket: this.bucket }));
+    return { ok: true, backend: this.backend };
+  }
+
+  async createSignedReadUrl(fileReference, expiresIn = this.signedUrlExpirySeconds) {
+    if (!Number.isInteger(expiresIn) || expiresIn < 60 || expiresIn > 3_600) {
+      throw new Error("Signed URL expiry must be between 60 and 3600 seconds");
+    }
+    return this.presigner(this.client, new GetObjectCommand({ Bucket: this.bucket, Key: this.safeKey(fileReference) }), { expiresIn });
+  }
+
   safeKey(fileReference) {
     if (typeof fileReference !== "string" || !fileReference.startsWith("private/") || fileReference.includes("..") || fileReference.includes("\\")) {
       throw new Error("Invalid private object reference");
@@ -110,6 +131,6 @@ export class S3PrivateStorage {
 export function createPrivateStorage(config, options = {}) {
   const backend = config.storageBackend || config.uploadStorageBackend;
   if (backend === "local") return new LocalPrivateStorage(config);
-  if (backend === "s3") return new S3PrivateStorage(config, options.s3Client);
+  if (backend === "s3") return new S3PrivateStorage(config, options.s3Client, options.presigner);
   throw new Error(`${backend} storage is not implemented. Configure a private storage adapter before starting the API.`);
 }

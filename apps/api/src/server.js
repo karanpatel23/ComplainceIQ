@@ -1,4 +1,5 @@
 import http from "node:http";
+import { randomUUID } from "node:crypto";
 import { URL } from "node:url";
 import { readConfig } from "../../../packages/config/src/index.js";
 import { createRepository } from "../../../packages/db/src/repository.js";
@@ -12,8 +13,11 @@ import { createEvidenceAiService } from "./evidence-ai-service.js";
 import { assertEvidenceDownloadAllowed, canProcessScannedEvidence, createMalwareScanner } from "./malware-scanner.js";
 import { createEvidenceProcessingQueue } from "./processing-queue.js";
 import { createReviewQueueService } from "./review-queue-service.js";
+import { validateUploadedFile } from "./file-validation.js";
+import { createOperationalLogger } from "./operational-logger.js";
 
 const config = readConfig(process.env);
+const logger = createOperationalLogger();
 const repo = await createRepository(config);
 const storage = createPrivateStorage(config);
 const aiProvider = createEvidenceAiProvider(config);
@@ -22,6 +26,7 @@ const malwareScanner = createMalwareScanner(config);
 const reviewQueueService = createReviewQueueService({ repo });
 const processingQueue = createEvidenceProcessingQueue(config, {
   repo,
+  logger,
   processor: async (job) => {
     const evidence = await repo.getEvidence(job.organizationId, job.evidenceId);
     if (!evidence || !canProcessScannedEvidence(evidence, config)) {
@@ -59,17 +64,40 @@ const DEFAULT_JSON_LIMIT_BYTES = 1024 * 1024;
 const UPLOAD_JSON_LIMIT_BYTES = Math.ceil(config.maxUploadMb * 1024 * 1024 * 4 / 3) + 256 * 1024;
 
 const server = http.createServer(async (req, res) => {
+  const requestId = requestCorrelationId(req.headers["x-request-id"]);
+  const startedAt = Date.now();
+  req.context = { requestId };
+  res.setHeader("X-Request-Id", requestId);
+  res.once("finish", () => logger.info("http_request_completed", {
+    requestId,
+    method: req.method,
+    route: req.context?.route || new URL(req.url || "/", "http://localhost").pathname,
+    statusCode: res.statusCode,
+    organizationId: req.context?.organizationId,
+    userId: req.context?.userId,
+    durationMs: Date.now() - startedAt
+  }));
   try {
     await handleRequest(req, res);
   } catch (error) {
     if (!error.status || error.status >= 500) {
-      process.stderr.write(`[ComplianceIQ API] ${error.stack || error.message}\n`);
+      logger.error("http_request_failed", {
+        requestId,
+        method: req.method,
+        route: req.context?.route || new URL(req.url || "/", "http://localhost").pathname,
+        statusCode: error.status || 500,
+        organizationId: req.context?.organizationId,
+        userId: req.context?.userId,
+        errorCode: error.code || "INTERNAL_ERROR",
+        durationMs: Date.now() - startedAt
+      });
     }
     sendJson(res, jsonError(error));
   }
 });
 
 async function handleRequest(req, res) {
+  applySecurityHeaders(res);
   applyCors(req, res);
   if (req.method === "OPTIONS") {
     res.writeHead(204);
@@ -81,11 +109,10 @@ async function handleRequest(req, res) {
   const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
   const path = url.pathname.replace(/\/$/, "") || "/";
   const method = req.method || "GET";
+  req.context.route = path;
 
-  if (method === "GET" && path === "/api/health") {
-    const persistence = await repo.healthCheck();
-    return sendJson(res, { status: 200, body: { ok: true, service: "ComplianceIQ API", persistence } });
-  }
+  if (method === "GET" && path === "/health/live") return sendJson(res, { status: 200, body: { ok: true, service: "ComplianceIQ API" } });
+  if (method === "GET" && ["/health", "/health/ready", "/api/health"].includes(path)) return readiness(res);
 
   if (method === "POST" && path === "/api/auth/login") return login(req, res);
   if (method === "POST" && path === "/api/auth/logout") return logout(req, res);
@@ -114,7 +141,7 @@ async function handleRequest(req, res) {
   if (path === "/api/evidence/upload" && method === "POST") return createEvidence(req, res, user, true);
   if (match(path, "/api/evidence/:id") && method === "GET") return getEvidence(res, user, params(path).id);
   if (match(path, "/api/evidence/:id") && method === "PATCH") return updateEvidence(req, res, user, params(path).id);
-  if (match(path, "/api/evidence/:id") && method === "DELETE") return archiveEvidence(res, user, params(path).id);
+  if (match(path, "/api/evidence/:id") && method === "DELETE") return archiveEvidence(req, res, user, params(path).id);
   if (match(path, "/api/evidence/:id/download") && method === "GET") return downloadEvidence(res, user, params(path).id);
   if (match(path, "/api/evidence/:id/process-ai") && method === "POST") return processEvidenceAi(res, user, params(path).id);
   if (match(path, "/api/evidence/:id/retry-processing") && method === "POST") return retryEvidenceProcessing(res, user, params(path).id);
@@ -138,6 +165,7 @@ async function handleRequest(req, res) {
   if (path === "/api/audit-packets" && method === "GET") return listPackets(res, user, url.searchParams.get("facilityId"));
   if (path === "/api/audit-packets/export" && method === "POST") return exportPacket(req, res, user);
   if (match(path, "/api/audit-packets/:id/download") && method === "GET") return downloadPacket(res, user, params(path).id);
+  if (match(path, "/api/audit-packets/:id") && method === "DELETE") return archivePacket(req, res, user, params(path).id);
 
   if (path === "/api/expert-reviews" && method === "GET") return sendJson(res, { status: 200, body: await repo.listExpertReviews(user.organizationId) });
   if (path === "/api/expert-reviews" && method === "POST") return requestExpertReview(req, res, user);
@@ -164,15 +192,15 @@ async function login(req, res) {
     userId: user.id,
     expiresAt: new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString()
   });
-  await repo.logAudit({ organizationId: user.organizationId, actorUserId: user.id, action: "login", entityType: "user", entityId: user.id, metadata: {}, ipAddress: req.socket.remoteAddress });
-  setCookie(res, "ciq.sid", signSessionId(session.id, config.sessionSecret), { maxAge: 8 * 60 * 60, httpOnly: true, sameSite: config.isProduction ? "None" : "Lax", secure: config.isProduction });
+  await repo.logAudit({ organizationId: user.organizationId, actorUserId: user.id, action: "login", entityType: "user", entityId: user.id, metadata: {}, ipAddress: clientIp(req) });
+  setCookie(res, "ciq.sid", signSessionId(session.id, config.sessionSecret), { maxAge: 8 * 60 * 60, httpOnly: true, sameSite: config.sessionCookieSameSite, secure: config.isProduction });
   sendJson(res, { status: 200, body: { user: toPublicUser(user) } });
 }
 
 async function logout(req, res) {
   const sessionId = getSessionId(req);
   if (sessionId) await repo.deleteSession(sessionId);
-  setCookie(res, "ciq.sid", "", { maxAge: 0, httpOnly: true, sameSite: "Lax", secure: config.isProduction });
+  setCookie(res, "ciq.sid", "", { maxAge: 0, httpOnly: true, sameSite: config.sessionCookieSameSite, secure: config.isProduction });
   sendJson(res, { status: 200, body: { ok: true } });
 }
 
@@ -183,6 +211,8 @@ async function requireSession(req) {
   if (!session) throw unauthorized();
   const user = await repo.findUserById(session.userId);
   if (!user || !user.isActive || user.organizationId !== session.organizationId) throw unauthorized();
+  req.context.organizationId = user.organizationId;
+  req.context.userId = user.id;
   return user;
 }
 
@@ -271,13 +301,39 @@ async function createEvidence(req, res, user, allowsFile) {
     if (!body.contentBase64) throw validationError("contentBase64 is required for evidence upload");
     uploadBuffer = decodeBase64(body.contentBase64);
     const fileName = safeOriginalFileName(body.fileName || "evidence.bin");
+    let validation;
+    try {
+      validation = validateUploadedFile({
+        buffer: uploadBuffer,
+        fileName,
+        declaredContentType: body.contentType,
+        maxBytes: config.maxUploadMb * 1024 * 1024
+      });
+    } catch (error) {
+      await audit(user, facility.id, "evidence_upload_rejected", "facility", facility.id, {
+        reasonCode: error.code || "FILE_VALIDATION_FAILED",
+        ...error.fileValidation
+      });
+      logger.warn("evidence_upload_rejected", {
+        requestId: req.context.requestId,
+        organizationId: user.organizationId,
+        userId: user.id,
+        facilityId: facility.id,
+        errorCode: error.code || "FILE_VALIDATION_FAILED"
+      });
+      throw error;
+    }
     const saved = await storage.saveBuffer(uploadBuffer, fileName);
     fileReference = saved.fileReference;
     fileMetadata = {
       fileName,
-      contentType: normalizeContentType(body.contentType),
+      contentType: validation.declaredContentType,
+      detectedContentType: validation.detectedContentType,
+      fileValidationStatus: validation.fileValidationStatus,
+      fileValidationError: validation.fileValidationError,
       fileSizeBytes: uploadBuffer.byteLength,
-      fileSha256: saved.sha256
+      fileSha256: saved.sha256,
+      storageDeletionStatus: "retained"
     };
   }
   let evidence;
@@ -294,7 +350,7 @@ async function createEvidence(req, res, user, allowsFile) {
     if (fileReference) await storage.deleteBuffer(fileReference);
     throw error;
   }
-  await audit(user, facility.id, allowsFile ? "evidence_uploaded" : "evidence.created", "evidence", evidence.id, { evidenceType: evidence.evidenceType, hasFile: allowsFile });
+  await audit(user, facility.id, allowsFile ? "evidence_uploaded" : "evidence.created", "evidence", evidence.id, { evidenceType: evidence.evidenceType, hasFile: allowsFile, requestId: req.context.requestId, detectedContentType: evidence.detectedContentType });
   let processingJob = null;
   if (allowsFile) {
     let scan;
@@ -310,7 +366,7 @@ async function createEvidence(req, res, user, allowsFile) {
       scannedAt: new Date().toISOString(),
       status: scan.status === "scan_suspicious" ? "needs_review" : evidence.status
     });
-    await audit(user, facility.id, scanEvent(scan.status), "evidence", evidence.id, { scanStatus: scan.status, provider: scan.provider });
+    await audit(user, facility.id, scanEvent(scan.status), "evidence", evidence.id, { scanStatus: scan.status, provider: scan.provider, requestId: req.context.requestId });
     if (canProcessScannedEvidence(evidence, config)) {
       processingJob = await processingQueue.enqueue({ organizationId: user.organizationId, facilityId: facility.id, evidenceId: evidence.id, createdByUserId: user.id });
     } else if (evidence.status === "pending") {
@@ -346,15 +402,38 @@ async function updateEvidence(req, res, user, id) {
   sendJson(res, { status: 200, body: evidence });
 }
 
-async function archiveEvidence(res, user, id) {
-  const evidence = await repo.archiveEvidence(user.organizationId, id);
-  await audit(user, evidence.facilityId, "evidence.archived", "evidence", evidence.id, {});
+async function archiveEvidence(req, res, user, id) {
+  requireRole(user, ["admin", "reviewer"]);
+  const existing = await requireEvidence(user.organizationId, id);
+  const deletionReason = deletionReasonFrom(req);
+  let storageDeletionStatus = existing.fileReference ? "deleted" : "not_applicable";
+  if (existing.fileReference) {
+    try {
+      await storage.deleteBuffer(existing.fileReference);
+    } catch (error) {
+      await repo.updateEvidence(user.organizationId, id, { storageDeletionStatus: "failed", storageDeletionError: safeOperationalError(error) });
+      await audit(user, existing.facilityId, "evidence_storage_deletion_failed", "evidence", id, { requestId: req.context.requestId, errorCode: error.code || "STORAGE_DELETE_FAILED" });
+      const failure = new Error("Evidence could not be archived because its private storage object could not be deleted");
+      failure.status = 502;
+      failure.code = "STORAGE_DELETE_FAILED";
+      throw failure;
+    }
+  }
+  const evidence = await repo.archiveEvidence(user.organizationId, id, {
+    fileReference: null,
+    deletedAt: new Date().toISOString(),
+    deletedByUserId: user.id,
+    deletionReason,
+    storageDeletionStatus,
+    storageDeletionError: null
+  });
+  await audit(user, evidence.facilityId, "evidence.archived", "evidence", evidence.id, { requestId: req.context.requestId, storageDeletionStatus, deletionReason });
   sendJson(res, { status: 200, body: evidence });
 }
 
 async function downloadEvidence(res, user, id) {
   const evidence = await requireEvidence(user.organizationId, id);
-  assertEvidenceDownloadAllowed(evidence);
+  assertEvidenceDownloadAllowed(evidence, config);
   if (!evidence.fileReference) {
     const error = new Error("Evidence has no file attachment");
     error.status = 404;
@@ -502,7 +581,7 @@ async function exportPacket(req, res, user) {
     await storage.deleteBuffer(saved.fileReference);
     throw error;
   }
-  await audit(user, facility.id, aiAnalyses.length ? "packet_exported_with_ai_lineage" : "packet.exported", "audit_packet", packet.id, { reviewId: review.id, aiAnalysisCount: aiAnalyses.length });
+  await audit(user, facility.id, aiAnalyses.length ? "packet_exported_with_ai_lineage" : "packet.exported", "audit_packet", packet.id, { reviewId: review.id, aiAnalysisCount: aiAnalyses.length, requestId: req.context.requestId });
   sendJson(res, { status: 201, body: { packet, downloadUrl: `/api/audit-packets/${packet.id}/download` } });
 }
 
@@ -518,9 +597,71 @@ async function downloadPacket(res, user, id) {
     error.status = 404;
     throw error;
   }
+  if (packet.archived || !packet.fileReference) {
+    const error = new Error("Audit packet is archived");
+    error.status = 410;
+    throw error;
+  }
   const buffer = await storage.readBuffer(packet.fileReference);
   await audit(user, packet.facilityId, "packet.downloaded", "audit_packet", packet.id, {});
   sendBuffer(res, buffer, "application/pdf", `industrial-audit-readiness-packet-${packet.id}.pdf`);
+}
+
+async function archivePacket(req, res, user, id) {
+  requireRole(user, ["admin", "reviewer"]);
+  const packet = await repo.getAuditPacket(user.organizationId, id);
+  if (!packet) {
+    const error = new Error("Audit packet not found");
+    error.status = 404;
+    throw error;
+  }
+  const deletionReason = deletionReasonFrom(req);
+  let storageDeletionStatus = packet.fileReference ? "deleted" : "deleted";
+  if (packet.fileReference) {
+    try {
+      await storage.deleteBuffer(packet.fileReference);
+    } catch (error) {
+      const failed = await repo.archiveAuditPacket(user.organizationId, id, {
+        archived: false,
+        deletedAt: null,
+        deletedByUserId: user.id,
+        deletionReason,
+        storageDeletionStatus: "failed",
+        storageDeletionError: safeOperationalError(error)
+      });
+      await audit(user, packet.facilityId, "packet_storage_deletion_failed", "audit_packet", id, { requestId: req.context.requestId, errorCode: error.code || "STORAGE_DELETE_FAILED" });
+      const failure = new Error(`Audit packet storage deletion failed; archive status is ${failed.storageDeletionStatus}`);
+      failure.status = 502;
+      failure.code = "STORAGE_DELETE_FAILED";
+      throw failure;
+    }
+  }
+  const archived = await repo.archiveAuditPacket(user.organizationId, id, {
+    deletedAt: new Date().toISOString(),
+    deletedByUserId: user.id,
+    deletionReason,
+    storageDeletionStatus,
+    storageDeletionError: null
+  });
+  await audit(user, packet.facilityId, "packet.archived", "audit_packet", id, { requestId: req.context.requestId, storageDeletionStatus, deletionReason });
+  sendJson(res, { status: 200, body: archived });
+}
+
+async function readiness(res) {
+  const checks = {};
+  for (const [name, check] of [
+    ["persistence", () => repo.healthCheck()],
+    ["storage", () => storage.healthCheck()],
+    ["queue", () => processingQueue.healthCheck()]
+  ]) {
+    try {
+      checks[name] = await check();
+    } catch (error) {
+      checks[name] = { ok: false, errorCode: error.code || `${name.toUpperCase()}_UNAVAILABLE` };
+    }
+  }
+  const ok = Object.values(checks).every((check) => check.ok);
+  sendJson(res, { status: ok ? 200 : 503, body: { ok, service: "ComplianceIQ API", config: { loaded: true }, ...checks } });
 }
 
 async function requestExpertReview(req, res, user) {
@@ -635,6 +776,15 @@ function sendBuffer(res, buffer, contentType, fileName) {
   res.end(buffer);
 }
 
+function applySecurityHeaders(res) {
+  res.setHeader("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  res.setHeader("X-Frame-Options", "DENY");
+  if (config.isProduction) res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+}
+
 function parseCookies(header) {
   return Object.fromEntries(header.split(";").filter(Boolean).map((part) => {
     const index = part.indexOf("=");
@@ -668,6 +818,28 @@ function enforceTrustedOrigin(req) {
   if (origin && !config.allowedOrigins.includes(origin)) throw forbidden("Origin is not allowed");
 }
 
+function clientIp(req) {
+  if (config.trustProxy) {
+    const forwarded = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+    if (forwarded) return forwarded.slice(0, 100);
+  }
+  return req.socket.remoteAddress;
+}
+
+function requestCorrelationId(value) {
+  const candidate = Array.isArray(value) ? value[0] : value;
+  return typeof candidate === "string" && /^[a-zA-Z0-9._:-]{8,128}$/.test(candidate) ? candidate : randomUUID();
+}
+
+function deletionReasonFrom(req) {
+  const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+  return String(url.searchParams.get("reason") || "User-requested archive").trim().slice(0, 500);
+}
+
+function safeOperationalError(error) {
+  return String(error?.code || error?.name || "STORAGE_DELETE_FAILED").slice(0, 100);
+}
+
 function match(path, pattern) {
   const a = path.split("/").filter(Boolean);
   const b = pattern.split("/").filter(Boolean);
@@ -688,11 +860,6 @@ function safeDownloadName(name) {
 
 function safeOriginalFileName(name) {
   return String(name || "evidence.bin").split(/[\\/]/).pop().replace(/[^a-z0-9._ -]+/gi, "-").slice(0, 180) || "evidence.bin";
-}
-
-function normalizeContentType(value) {
-  const contentType = String(value || "application/octet-stream").trim().toLowerCase();
-  return /^[a-z0-9.+-]+\/[a-z0-9.+-]+$/.test(contentType) ? contentType : "application/octet-stream";
 }
 
 function scanEvent(status) {
@@ -724,10 +891,11 @@ function decodeBase64(value) {
 
 if (process.env.NODE_ENV !== "test") {
   server.listen(config.port, config.apiHost, () => {
-    process.stderr.write(`ComplianceIQ API listening on http://${config.apiHost}:${config.port}\n`);
+    logger.info("api_listening", { host: config.apiHost, port: config.port });
   });
   const shutdown = () => server.close(async () => {
-    processingQueue.stop();
+    const queueShutdown = await processingQueue.stop({ timeoutMs: config.queueShutdownTimeoutMs });
+    logger.info("api_shutdown", { queueDrained: queueShutdown.drained, activeJobs: queueShutdown.activeJobs });
     await repo.close?.();
     process.exit(0);
   });
@@ -735,6 +903,6 @@ if (process.env.NODE_ENV !== "test") {
   process.once("SIGINT", shutdown);
 }
 
-server.on("close", () => processingQueue.stop());
+server.on("close", () => void processingQueue.stop());
 
-export { server, repo, processingQueue, malwareScanner };
+export { server, repo, processingQueue, malwareScanner, storage, logger };

@@ -29,7 +29,8 @@ test("production config rejects wildcard CORS and weak session secrets", () => {
 
 test("production config rejects invalid ports and origins", () => {
   assert.throws(() => readConfig({ ...productionEnv, PORT: "70000" }), /PORT/);
-  assert.throws(() => readConfig({ ...productionEnv, ALLOWED_ORIGINS: "not-a-url" }), /valid absolute URLs/);
+  assert.throws(() => readConfig({ ...productionEnv, ALLOWED_ORIGINS: "not-a-url" }), /valid absolute HTTPS URLs/);
+  assert.throws(() => readConfig({ ...productionEnv, APP_URL: "http://app.complianceiq.example" }), /HTTPS/);
 });
 
 test("production config accepts optional integrations as absent", () => {
@@ -46,7 +47,13 @@ test("production storage and malware scanning config fail safely", () => {
   assert.throws(() => readConfig({ ...productionEnv, MALWARE_SCAN_ENABLED: "true", MALWARE_SCANNER_PROVIDER: "mock" }), /mock is not allowed/);
   const local = readConfig({ NODE_ENV: "development", REPOSITORY_BACKEND: "file", STORAGE_BACKEND: "local" });
   assert.equal(local.queueMaxRetries, 3);
+  assert.equal(local.queueLeaseMs, 300000);
   assert.equal(local.malwareScanEnabled, false);
+  assert.equal(local.malwareScanFailPolicy, "open");
+  assert.throws(() => readConfig({ ...productionEnv, MALWARE_SCAN_ENABLED: "true", MALWARE_SCAN_REQUIRED_IN_PRODUCTION: "true", MALWARE_SCANNER_PROVIDER: "clamav", MALWARE_SCAN_FAIL_POLICY: "open" }), /non-mock scanner adapter/);
+  const hardened = readConfig({ ...productionEnv, MALWARE_SCAN_ENABLED: "true", MALWARE_SCAN_REQUIRED_IN_PRODUCTION: "true", MALWARE_SCANNER_PROVIDER: "clamav", MALWARE_SCAN_FAIL_POLICY: "closed", CLAMAV_HOST: "clamav.internal" });
+  assert.equal(hardened.malwareScannerProvider, "clamav");
+  assert.equal(hardened.malwareScanFailPolicy, "closed");
 });
 
 test("repository config requires Postgres in production without requiring unrelated runtime settings", () => {

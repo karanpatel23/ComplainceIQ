@@ -63,6 +63,12 @@ test("API requires auth and blocks cross-organization access", async () => {
     const health = await fetch(`${base}/api/health`);
     assert.equal(health.status, 200);
     assert.equal((await health.json()).persistence.backend, "file");
+    assert.equal(health.headers.get("x-content-type-options"), "nosniff");
+    assert.equal(health.headers.get("x-frame-options"), "DENY");
+    assert.ok(health.headers.get("content-security-policy").includes("frame-ancestors 'none'"));
+    assert.ok(health.headers.get("x-request-id"));
+    assert.equal((await fetch(`${base}/health/live`)).status, 200);
+    assert.equal((await fetch(`${base}/health/ready`)).status, 200);
 
     const unauth = await fetch(`${base}/api/facilities`);
     assert.equal(unauth.status, 401);
@@ -98,6 +104,14 @@ test("API requires auth and blocks cross-organization access", async () => {
       body: JSON.stringify({ facilityId: facility.id, title: "Invalid upload", evidenceType: "loto_procedures", contentBase64: "not base64" })
     });
     assert.equal(invalidUpload.status, 400);
+
+    const dangerousUpload = await fetch(`${base}/api/evidence/upload`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ facilityId: facility.id, title: "Active content", evidenceType: "other", fileName: "evidence.txt", contentType: "text/plain", contentBase64: Buffer.from("<!doctype html><script>alert(1)</script>").toString("base64") })
+    });
+    assert.equal(dangerousUpload.status, 415);
+    assert.equal((await dangerousUpload.json()).code, "ACTIVE_CONTENT_NOT_ALLOWED");
 
     const denied = await fetch(`${base}/api/facilities/${otherFacility.id}`, { headers: { cookie } });
     assert.equal(denied.status, 403);
@@ -210,6 +224,8 @@ test("API requires auth and blocks cross-organization access", async () => {
     assert.equal(deniedEvidence.status, 403);
     const deniedPacket = await fetch(`${base}/api/audit-packets/${packet.id}/download`, { headers: { cookie: cookieB } });
     assert.equal(deniedPacket.status, 403);
+    assert.equal((await fetch(`${base}/api/evidence/${evidence.id}`, { method: "DELETE", headers: { cookie: cookieB } })).status, 403);
+    assert.equal((await fetch(`${base}/api/audit-packets/${packet.id}`, { method: "DELETE", headers: { cookie: cookieB } })).status, 403);
     const deniedGapMatrix = await fetch(`${base}/api/audit-readiness/reviews/${generatedBody.review.id}/gap-matrix`, { headers: { cookie: cookieB } });
     assert.equal(deniedGapMatrix.status, 403);
     const deniedAuditLogs = await fetch(`${base}/api/audit-logs?facilityId=${facility.id}`, { headers: { cookie: cookieB } });
@@ -222,6 +238,28 @@ test("API requires auth and blocks cross-organization access", async () => {
     assert.ok(auditLogs.some((entry) => entry.action === "ai_classification_generated"));
     assert.ok(auditLogs.some((entry) => entry.action === "human_accepted_ai_result"));
     assert.ok(auditLogs.some((entry) => entry.action === "packet_exported_with_ai_lineage"));
+    assert.ok(auditLogs.some((entry) => entry.action === "evidence_upload_rejected"));
+
+    const packetDelete = await fetch(`${base}/api/audit-packets/${packet.id}?reason=Pilot%20cleanup`, { method: "DELETE", headers: { cookie } });
+    assert.equal(packetDelete.status, 200);
+    const deletedPacket = await packetDelete.json();
+    assert.equal(deletedPacket.archived, true);
+    assert.equal(deletedPacket.storageDeletionStatus, "deleted");
+    assert.equal(deletedPacket.fileReference, null);
+    assert.equal((await fetch(`${base}/api/audit-packets/${packet.id}/download`, { headers: { cookie } })).status, 410);
+
+    const evidenceDelete = await fetch(`${base}/api/evidence/${evidence.id}?reason=Pilot%20cleanup`, { method: "DELETE", headers: { cookie } });
+    assert.equal(evidenceDelete.status, 200);
+    const deletedEvidence = await evidenceDelete.json();
+    assert.equal(deletedEvidence.archived, true);
+    assert.equal(deletedEvidence.storageDeletionStatus, "deleted");
+    assert.equal(deletedEvidence.fileReference, null);
+    const deletionLogs = await repo.listAuditLogs(orgA.id, facility.id);
+    assert.ok(deletionLogs.some((entry) => entry.action === "packet.archived"));
+    assert.ok(deletionLogs.some((entry) => entry.action === "evidence.archived"));
+    await processingQueue.stop();
+    assert.equal((await fetch(`${base}/health/ready`)).status, 503);
+    assert.equal((await fetch(`${base}/health/live`)).status, 200);
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }

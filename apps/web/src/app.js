@@ -190,7 +190,10 @@ function evidenceCard(item) {
     <article class="evidence-card">
       <div class="evidence-heading">
         <div><strong>${html(item.title)}</strong><span>${html(label(item.evidenceType))} · ${html(item.status)}${item.fileName ? ` · ${html(item.fileName)}` : ""}</span></div>
-        <button class="secondary" data-process-ai="${html(item.id)}" ${state.aiStatus.enabled && !active && !blocked ? "" : "disabled"}>${active ? "Processing…" : analysis ? "Queue reprocessing" : "Queue AI processing"}</button>
+        <div class="review-actions">
+          <button class="secondary" data-process-ai="${html(item.id)}" ${state.aiStatus.enabled && !active && !blocked ? "" : "disabled"}>${active ? "Processing…" : analysis ? "Queue reprocessing" : "Queue AI processing"}</button>
+          ${canReview() ? `<button class="danger-button" data-archive-evidence="${html(item.id)}">Archive evidence</button>` : ""}
+        </div>
       </div>
       ${processingBadges(item, job, analysis)}
       ${analysis ? aiAnalysisDetails(analysis) : `<p class="muted">No AI analysis yet. ${state.aiStatus.enabled ? "Processing begins after the private scan and queue claim." : "AI is disabled; manual review remains available."}</p>`}
@@ -217,7 +220,7 @@ function processingLabel(item, job, analysis) {
   if (analysis?.textExtractionStatus === "ocr_required") return { code: "ocr_required", text: "OCR / manual review required" };
   if (job?.status === "queued") return { code: "queued", text: "Processing queued" };
   if (job?.status === "processing") return { code: "processing", text: "Extracting text / AI analyzing" };
-  if (job?.status === "failed" || analysis?.processingStatus === "failed") return { code: "failed", text: "Processing failed" };
+  if (["failed", "dead_letter"].includes(job?.status) || analysis?.processingStatus === "failed") return { code: "failed", text: job?.status === "dead_letter" ? "Dead letter / operator review" : "Processing failed" };
   if (analysis?.processingStatus === "needs_review") return { code: "needs_review", text: "Needs review" };
   if (analysis?.processingStatus === "processed") return { code: "processed", text: "Processed" };
   return { code: "uploaded", text: "Uploaded" };
@@ -316,7 +319,7 @@ function canReview() {
 
 function statusTone(value) {
   if (["processed", "scan_clean", "accepted"].includes(value)) return "accepted";
-  if (["failed", "blocked", "scan_suspicious", "critical", "rejected"].includes(value)) return "rejected";
+  if (["failed", "dead_letter", "blocked", "scan_suspicious", "critical", "rejected"].includes(value)) return "rejected";
   if (["queued", "processing", "needs_review", "ocr_required", "high", "medium", "scan_unavailable"].includes(value)) return "partial";
   return "";
 }
@@ -402,7 +405,7 @@ function packetPanel() {
     </section>
     <section class="panel">
       <h2>Generated Packets</h2>
-      <div class="mini-list">${state.packets.length ? state.packets.map((packet) => `<div><strong>${html(packet.title)}</strong><span>${html(packet.generatedAt)}</span><button class="secondary" data-packet-download="${html(packet.id)}">Download</button></div>`).join("") : "<p>No packets exported yet.</p>"}</div>
+      <div class="mini-list">${state.packets.length ? state.packets.map((packet) => `<div><strong>${html(packet.title)}</strong><span>${html(packet.generatedAt)}</span><button class="secondary" data-packet-download="${html(packet.id)}">Download</button>${canReview() ? `<button class="danger-button" data-archive-packet="${html(packet.id)}">Archive</button>` : ""}</div>`).join("") : "<p>No packets exported yet.</p>"}</div>
     </section>
   `;
 }
@@ -435,6 +438,8 @@ function bindEvents() {
   document.querySelectorAll("[data-retry-processing]").forEach((button) => button.addEventListener("click", () => onRetryProcessing(button.dataset.retryProcessing)));
   document.querySelectorAll("[data-ai-review]").forEach((form) => form.addEventListener("submit", onReviewAi));
   document.querySelectorAll("[data-packet-download]").forEach((button) => button.addEventListener("click", () => onDownloadPacket(button.dataset.packetDownload)));
+  document.querySelectorAll("[data-archive-evidence]").forEach((button) => button.addEventListener("click", () => onArchiveEvidence(button.dataset.archiveEvidence)));
+  document.querySelectorAll("[data-archive-packet]").forEach((button) => button.addEventListener("click", () => onArchivePacket(button.dataset.archivePacket)));
   document.querySelector("#review-queue-filters")?.addEventListener("change", onReviewQueueFilter);
 }
 
@@ -514,12 +519,14 @@ async function refreshFacilityData() {
 async function onCreateFacility(event) {
   event.preventDefault();
   const form = new FormData(event.target);
+  const country = String(form.get("country") || "");
+  const region = String(form.get("region") || "");
   const body = {
     name: form.get("name"),
-    country: form.get("country"),
+    country,
     stateProvince: form.get("stateProvince"),
-    region: form.get("region"),
-    jurisdictionCode: form.get("jurisdictionCode"),
+    region,
+    jurisdictionCode: String(form.get("jurisdictionCode") || "").trim() || `${country}-${region}`,
     industry: form.get("industry"),
     facilityType: form.get("facilityType"),
     employeeCount: Number(form.get("employeeCount")),
@@ -631,6 +638,22 @@ async function onDownloadPacket(packetId) {
     link.download = `industrial-audit-readiness-packet-${packetId}.pdf`;
     link.click();
     window.setTimeout(() => URL.revokeObjectURL(url), 0);
+  });
+}
+
+async function onArchiveEvidence(evidenceId) {
+  if (!window.confirm("Archive this evidence record and delete its private file? Audit history will remain.")) return;
+  await run(async () => {
+    await api(`/api/evidence/${encodeURIComponent(evidenceId)}?reason=${encodeURIComponent("Archived from Audit Packet Builder")}`, { method: "DELETE" });
+    await refreshFacilityData();
+  });
+}
+
+async function onArchivePacket(packetId) {
+  if (!window.confirm("Archive this packet and delete its generated private PDF? Audit history will remain.")) return;
+  await run(async () => {
+    await api(`/api/audit-packets/${encodeURIComponent(packetId)}?reason=${encodeURIComponent("Archived from Audit Packet Builder")}`, { method: "DELETE" });
+    await refreshFacilityData();
   });
 }
 

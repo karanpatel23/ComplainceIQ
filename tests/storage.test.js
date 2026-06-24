@@ -46,12 +46,49 @@ test("S3 private storage uses opaque keys and never exposes a public URL", async
     s3ForcePathStyle: false,
     s3AccessKeyId: "",
     s3SecretAccessKey: ""
-  }, { s3Client: client });
+  }, { s3Client: client, presigner: async (_client, command, options) => `https://private.example/${command.input.Key}?X-Amz-Expires=${options.expiresIn}` });
   const saved = await storage.saveBuffer(Buffer.from("private object"), "record.pdf");
   assert.match(saved.fileReference, /^private\/[a-f0-9-]+\.pdf$/);
   assert.equal(saved.fileReference.includes("http"), false);
   assert.equal((await storage.readBuffer(saved.fileReference)).toString(), "private object");
+  const signed = await storage.createSignedReadUrl(saved.fileReference, 120);
+  assert.equal(new URL(signed).searchParams.get("X-Amz-Expires"), "120");
+  await assert.rejects(() => storage.createSignedReadUrl(saved.fileReference, 10), /between 60 and 3600/);
   await assert.rejects(() => storage.readBuffer("../public/object"), /Invalid private object reference/);
   await storage.deleteBuffer(saved.fileReference);
   assert.equal(objects.size, 0);
 });
+
+test("S3-compatible integration uploads, retrieves, and deletes a private object", { skip: !hasS3IntegrationConfig() }, async () => {
+  const storage = createPrivateStorage({
+    storageBackend: "s3",
+    maxUploadMb: 1,
+    s3Bucket: process.env.TEST_S3_BUCKET,
+    s3Region: process.env.TEST_S3_REGION,
+    s3Endpoint: process.env.TEST_S3_ENDPOINT || "",
+    s3ForcePathStyle: process.env.TEST_S3_FORCE_PATH_STYLE === "true",
+    s3AccessKeyId: process.env.TEST_S3_ACCESS_KEY_ID || "",
+    s3SecretAccessKey: process.env.TEST_S3_SECRET_ACCESS_KEY || "",
+    signedUrlExpirySeconds: 120
+  });
+  const marker = `private-s3-integration-${Date.now()}`;
+  const saved = await storage.saveBuffer(Buffer.from(marker), "integration.txt");
+  try {
+    assert.match(saved.fileReference, /^private\/[a-f0-9-]+\.txt$/);
+    assert.equal(saved.fileReference.includes("http"), false);
+    assert.equal((await storage.readBuffer(saved.fileReference)).toString(), marker);
+    const signed = await storage.createSignedReadUrl(saved.fileReference, 120);
+    assert.equal(new URL(signed).searchParams.get("X-Amz-Expires"), "120");
+    const signedResponse = await fetch(signed);
+    assert.equal(signedResponse.ok, true);
+    assert.equal(await signedResponse.text(), marker);
+  } finally {
+    await storage.deleteBuffer(saved.fileReference);
+  }
+  await assert.rejects(() => storage.readBuffer(saved.fileReference));
+});
+
+function hasS3IntegrationConfig() {
+  return Boolean(process.env.TEST_S3_BUCKET && process.env.TEST_S3_REGION
+    && process.env.TEST_S3_ACCESS_KEY_ID && process.env.TEST_S3_SECRET_ACCESS_KEY);
+}

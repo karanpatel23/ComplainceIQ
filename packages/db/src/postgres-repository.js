@@ -186,9 +186,9 @@ export class PostgresRepository {
     }
     const id = input.id || this.createId();
     const [row] = await this.query(
-      `INSERT INTO evidence (id, organization_id, facility_id, title, description, evidence_type, file_reference, file_name, content_type, file_size_bytes, file_sha256, scan_status, scan_provider, scan_error, scanned_at, uploaded_by_user_id, country, region, related_obligation_id, document_date, expiration_date, status, confidence, reviewer_notes, archived)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25) RETURNING *`,
-      [id, input.organizationId, input.facilityId, input.title, input.description, input.evidenceType, input.fileReference, input.fileName, input.contentType, input.fileSizeBytes, input.fileSha256, input.scanStatus, input.scanProvider, input.scanError, input.scannedAt, input.uploadedByUserId, input.country, input.region, input.relatedObligationId, input.documentDate, input.expirationDate, input.status, input.confidence, input.reviewerNotes, input.archived ?? false]
+      `INSERT INTO evidence (id, organization_id, facility_id, title, description, evidence_type, file_reference, file_name, content_type, detected_content_type, file_validation_status, file_validation_error, file_size_bytes, file_sha256, scan_status, scan_provider, scan_error, scanned_at, uploaded_by_user_id, country, region, related_obligation_id, document_date, expiration_date, status, confidence, reviewer_notes, archived, deleted_at, deleted_by_user_id, deletion_reason, retention_until, storage_deletion_status, storage_deletion_error)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34) RETURNING *`,
+      [id, input.organizationId, input.facilityId, input.title, input.description, input.evidenceType, input.fileReference, input.fileName, input.contentType, input.detectedContentType, input.fileValidationStatus || "not_applicable", input.fileValidationError, input.fileSizeBytes, input.fileSha256, input.scanStatus, input.scanProvider, input.scanError, input.scannedAt, input.uploadedByUserId, input.country, input.region, input.relatedObligationId, input.documentDate, input.expirationDate, input.status, input.confidence, input.reviewerNotes, input.archived ?? false, input.deletedAt, input.deletedByUserId, input.deletionReason, input.retentionUntil, input.storageDeletionStatus || (input.fileReference ? "retained" : "not_applicable"), input.storageDeletionError]
     );
     return camelEvidence(row);
   }
@@ -209,15 +209,16 @@ export class PostgresRepository {
     const current = await this.getEvidence(organizationId, id);
     const next = { ...current, ...updates };
     const [row] = await this.query(
-      `UPDATE evidence SET title=$3, description=$4, evidence_type=$5, file_reference=$6, file_name=$7, content_type=$8, file_size_bytes=$9, file_sha256=$10, scan_status=$11, scan_provider=$12, scan_error=$13, scanned_at=$14, country=$15, region=$16, related_obligation_id=$17, document_date=$18, expiration_date=$19, status=$20, confidence=$21, reviewer_notes=$22, archived=$23, updated_at=now()
+      `UPDATE evidence SET title=$3, description=$4, evidence_type=$5, file_reference=$6, file_name=$7, content_type=$8, detected_content_type=$9, file_validation_status=$10, file_validation_error=$11, file_size_bytes=$12, file_sha256=$13, scan_status=$14, scan_provider=$15, scan_error=$16, scanned_at=$17, country=$18, region=$19, related_obligation_id=$20, document_date=$21, expiration_date=$22, status=$23, confidence=$24, reviewer_notes=$25, archived=$26, deleted_at=$27, deleted_by_user_id=$28, deletion_reason=$29, retention_until=$30, storage_deletion_status=$31, storage_deletion_error=$32, updated_at=now()
        WHERE organization_id=$1 AND id=$2 RETURNING *`,
-      [organizationId, id, next.title, next.description, next.evidenceType, next.fileReference, next.fileName, next.contentType, next.fileSizeBytes, next.fileSha256, next.scanStatus, next.scanProvider, next.scanError, next.scannedAt, next.country, next.region, next.relatedObligationId, next.documentDate, next.expirationDate, next.status, next.confidence, next.reviewerNotes, next.archived]
+      [organizationId, id, next.title, next.description, next.evidenceType, next.fileReference, next.fileName, next.contentType, next.detectedContentType, next.fileValidationStatus, next.fileValidationError, next.fileSizeBytes, next.fileSha256, next.scanStatus, next.scanProvider, next.scanError, next.scannedAt, next.country, next.region, next.relatedObligationId, next.documentDate, next.expirationDate, next.status, next.confidence, next.reviewerNotes, next.archived, next.deletedAt, next.deletedByUserId, next.deletionReason, next.retentionUntil, next.storageDeletionStatus, next.storageDeletionError]
     );
     return camelEvidence(row);
   }
 
-  async archiveEvidence(organizationId, id) {
-    return this.updateEvidence(organizationId, id, { archived: true });
+  async archiveEvidence(organizationId, id, deletion = {}) {
+    if (deletion.deletedByUserId) await this.assertUserOrganization(deletion.deletedByUserId, organizationId, "Deletion actor");
+    return this.updateEvidence(organizationId, id, { archived: true, ...deletion });
   }
 
   async upsertAiAnalysis(input) {
@@ -345,7 +346,7 @@ export class PostgresRepository {
     return (await this.query(`${sql} ORDER BY created_at DESC`, params)).map(camelProcessingJob);
   }
 
-  async claimNextProcessingJob() {
+  async claimNextProcessingJob({ workerId = `worker-${process.pid}`, leaseToken = this.createId(), leaseExpiresAt = new Date(Date.now() + 300_000).toISOString() } = {}) {
     const [row] = await this.query(
       `WITH next_job AS (
          SELECT id FROM evidence_processing_jobs
@@ -356,45 +357,69 @@ export class PostgresRepository {
        )
        UPDATE evidence_processing_jobs AS jobs
        SET status='processing', processing_attempts=processing_attempts + 1,
-           processing_started_at=now(), next_retry_at=NULL, updated_at=now()
+           processing_started_at=now(), next_retry_at=NULL, worker_id=$1, lease_token=$2,
+           lease_expires_at=$3, heartbeat_at=now(), updated_at=now()
        FROM next_job
        WHERE jobs.id=next_job.id
-       RETURNING jobs.*`
+       RETURNING jobs.*`,
+      [workerId, leaseToken, leaseExpiresAt]
     );
     return row ? camelProcessingJob(row) : null;
   }
 
-  async recoverStaleProcessingJobs(staleBefore) {
-    await this.query(
+  async heartbeatProcessingJob(organizationId, id, { leaseToken, leaseExpiresAt }) {
+    const [row] = await this.query(
+      `UPDATE evidence_processing_jobs SET heartbeat_at=now(), lease_expires_at=$4, updated_at=now()
+       WHERE organization_id=$1 AND id=$2 AND status='processing' AND lease_token=$3 RETURNING *`,
+      [organizationId, id, leaseToken, leaseExpiresAt]
+    );
+    if (!row) throw leaseLostError(id);
+    return camelProcessingJob(row);
+  }
+
+  async recoverStaleProcessingJobs(expiredBefore = new Date().toISOString()) {
+    const rows = await this.query(
       `UPDATE evidence_processing_jobs
-       SET status=CASE WHEN processing_attempts < max_attempts THEN 'queued' ELSE 'failed' END,
-           last_processing_error='Recovered after an interrupted worker process.',
-           next_retry_at=NULL,
+       SET status=CASE WHEN processing_attempts < max_attempts THEN 'queued' ELSE 'dead_letter' END,
+           last_processing_error='Recovered after an expired worker lease.', next_retry_at=NULL,
            processing_completed_at=CASE WHEN processing_attempts >= max_attempts THEN now() ELSE NULL END,
+           dead_lettered_at=CASE WHEN processing_attempts >= max_attempts THEN now() ELSE NULL END,
+           worker_id=NULL, lease_token=NULL, lease_expires_at=NULL, heartbeat_at=NULL,
            updated_at=now()
-       WHERE status='processing' AND processing_started_at < $1`,
-      [staleBefore]
+       WHERE status='processing' AND COALESCE(lease_expires_at, processing_started_at) < $1
+       RETURNING *`,
+      [expiredBefore]
     );
+    return rows.map(camelProcessingJob);
   }
 
-  async completeProcessingJob(organizationId, id) {
+  async completeProcessingJob(organizationId, id, leaseToken) {
     const [row] = await this.query(
-      "UPDATE evidence_processing_jobs SET status='completed', processing_completed_at=now(), last_processing_error=NULL, updated_at=now() WHERE organization_id=$1 AND id=$2 RETURNING *",
-      [organizationId, id]
+      "UPDATE evidence_processing_jobs SET status='completed', processing_completed_at=now(), last_processing_error=NULL, worker_id=NULL, lease_token=NULL, lease_expires_at=NULL, heartbeat_at=NULL, updated_at=now() WHERE organization_id=$1 AND id=$2 AND status='processing' AND lease_token=$3 RETURNING *",
+      [organizationId, id, leaseToken]
     );
-    return row ? camelProcessingJob(row) : null;
+    if (!row) throw leaseLostError(id);
+    return camelProcessingJob(row);
   }
 
-  async failProcessingJob(organizationId, id, { error, retryAt = null }) {
+  async failProcessingJob(organizationId, id, { error, retryAt = null, leaseToken }) {
     const [row] = await this.query(
       `UPDATE evidence_processing_jobs
-       SET status=$3, last_processing_error=$4, next_retry_at=$5,
+       SET status=$3, last_processing_error=$4, next_retry_at=$5, worker_id=NULL, lease_token=NULL,
+           lease_expires_at=NULL, heartbeat_at=NULL,
            processing_completed_at=CASE WHEN $5::timestamptz IS NULL THEN now() ELSE NULL END,
+           dead_lettered_at=CASE WHEN $5::timestamptz IS NULL THEN now() ELSE NULL END,
            updated_at=now()
-       WHERE organization_id=$1 AND id=$2 RETURNING *`,
-      [organizationId, id, retryAt ? "queued" : "failed", String(error || "Processing failed").slice(0, 500), retryAt]
+       WHERE organization_id=$1 AND id=$2 AND status='processing' AND lease_token=$6 RETURNING *`,
+      [organizationId, id, retryAt ? "queued" : "dead_letter", String(error || "Processing failed").slice(0, 500), retryAt, leaseToken]
     );
-    return row ? camelProcessingJob(row) : null;
+    if (!row) throw leaseLostError(id);
+    return camelProcessingJob(row);
+  }
+
+  async getProcessingQueueMetrics() {
+    const rows = await this.query("SELECT status, count(*)::integer AS count FROM evidence_processing_jobs GROUP BY status");
+    return Object.fromEntries(rows.map((row) => [row.status, row.count]));
   }
 
   async applyAiHumanReview(input) {
@@ -600,16 +625,16 @@ export class PostgresRepository {
     if (input.rulesPackId !== review.rulesPackId) throw forbidden("Packet rules pack does not match the review rules pack");
     const id = input.id || this.createId();
     const [row] = await this.query(
-      `INSERT INTO audit_packets (id, organization_id, facility_id, review_id, title, file_reference, generated_by_user_id, country, region, rules_pack_id, status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
-      [id, input.organizationId, input.facilityId, input.reviewId, input.title, input.fileReference, input.generatedByUserId, input.country, input.region, input.rulesPackId, input.status]
+      `INSERT INTO audit_packets (id, organization_id, facility_id, review_id, title, file_reference, generated_by_user_id, country, region, rules_pack_id, status, archived, deleted_at, deleted_by_user_id, deletion_reason, retention_until, storage_deletion_status, storage_deletion_error)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING *`,
+      [id, input.organizationId, input.facilityId, input.reviewId, input.title, input.fileReference, input.generatedByUserId, input.country, input.region, input.rulesPackId, input.status, input.archived ?? false, input.deletedAt, input.deletedByUserId, input.deletionReason, input.retentionUntil, input.storageDeletionStatus || "retained", input.storageDeletionError]
     );
     return camelPacket(row);
   }
 
   async listAuditPackets(organizationId, facilityId = null) {
     const params = [organizationId];
-    let where = "organization_id = $1";
+    let where = "organization_id = $1 AND archived = false";
     if (facilityId) {
       params.push(facilityId);
       where += " AND facility_id = $2";
@@ -619,6 +644,19 @@ export class PostgresRepository {
 
   async getAuditPacket(organizationId, id) {
     return this.getScoped("audit_packets", organizationId, id, "Audit packet", camelPacket);
+  }
+
+  async archiveAuditPacket(organizationId, id, deletion = {}) {
+    await this.getAuditPacket(organizationId, id);
+    if (deletion.deletedByUserId) await this.assertUserOrganization(deletion.deletedByUserId, organizationId, "Deletion actor");
+    const [row] = await this.query(
+      `UPDATE audit_packets SET archived=$3, deleted_at=$4, deleted_by_user_id=$5, deletion_reason=$6,
+         retention_until=$7, storage_deletion_status=$8, storage_deletion_error=$9,
+         file_reference=CASE WHEN $8='deleted' THEN NULL ELSE file_reference END
+       WHERE organization_id=$1 AND id=$2 RETURNING *`,
+      [organizationId, id, deletion.archived ?? true, deletion.deletedAt, deletion.deletedByUserId, deletion.deletionReason, deletion.retentionUntil, deletion.storageDeletionStatus || "retained", deletion.storageDeletionError]
+    );
+    return camelPacket(row);
   }
 
   async createExpertReview(input) {
@@ -665,6 +703,12 @@ export class PostgresRepository {
       where += " AND facility_id = $2";
     }
     return await this.query(`SELECT * FROM audit_logs WHERE ${where} ORDER BY created_at DESC LIMIT 200`, params);
+  }
+
+  async assertUserOrganization(userId, organizationId, label = "User") {
+    const user = await this.findUserById(userId);
+    if (!user || user.organizationId !== organizationId) throw forbidden(`${label} does not belong to this organization`);
+    return user;
   }
 
   async getScoped(table, organizationId, id, label, mapper) {
@@ -745,7 +789,7 @@ function camelFacility(row) {
 }
 
 function camelEvidence(row) {
-  return { id: row.id, organizationId: row.organization_id, facilityId: row.facility_id, title: row.title, description: row.description, evidenceType: row.evidence_type, fileReference: row.file_reference, fileName: row.file_name, contentType: row.content_type, fileSizeBytes: row.file_size_bytes === null ? null : Number(row.file_size_bytes), fileSha256: row.file_sha256, scanStatus: row.scan_status, scanProvider: row.scan_provider, scanError: row.scan_error, scannedAt: row.scanned_at, uploadedByUserId: row.uploaded_by_user_id, country: row.country, region: row.region, relatedObligationId: row.related_obligation_id, documentDate: row.document_date, expirationDate: row.expiration_date, status: row.status, confidence: row.confidence, reviewerNotes: row.reviewer_notes, archived: row.archived, createdAt: row.created_at, updatedAt: row.updated_at };
+  return { id: row.id, organizationId: row.organization_id, facilityId: row.facility_id, title: row.title, description: row.description, evidenceType: row.evidence_type, fileReference: row.file_reference, fileName: row.file_name, contentType: row.content_type, detectedContentType: row.detected_content_type, fileValidationStatus: row.file_validation_status, fileValidationError: row.file_validation_error, fileSizeBytes: row.file_size_bytes === null ? null : Number(row.file_size_bytes), fileSha256: row.file_sha256, scanStatus: row.scan_status, scanProvider: row.scan_provider, scanError: row.scan_error, scannedAt: row.scanned_at, uploadedByUserId: row.uploaded_by_user_id, country: row.country, region: row.region, relatedObligationId: row.related_obligation_id, documentDate: row.document_date, expirationDate: row.expiration_date, status: row.status, confidence: row.confidence, reviewerNotes: row.reviewer_notes, archived: row.archived, deletedAt: row.deleted_at, deletedByUserId: row.deleted_by_user_id, deletionReason: row.deletion_reason, retentionUntil: row.retention_until, storageDeletionStatus: row.storage_deletion_status, storageDeletionError: row.storage_deletion_error, createdAt: row.created_at, updatedAt: row.updated_at };
 }
 
 function camelAiAnalysis(row) {
@@ -786,6 +830,11 @@ function camelProcessingJob(row) {
     processingStartedAt: row.processing_started_at,
     processingCompletedAt: row.processing_completed_at,
     nextRetryAt: row.next_retry_at,
+    workerId: row.worker_id,
+    leaseToken: row.lease_token,
+    leaseExpiresAt: row.lease_expires_at,
+    heartbeatAt: row.heartbeat_at,
+    deadLetteredAt: row.dead_lettered_at,
     createdByUserId: row.created_by_user_id,
     createdAt: row.created_at,
     updatedAt: row.updated_at
@@ -805,7 +854,14 @@ function camelReview(row) {
 }
 
 function camelPacket(row) {
-  return { id: row.id, organizationId: row.organization_id, facilityId: row.facility_id, reviewId: row.review_id, title: row.title, fileReference: row.file_reference, generatedByUserId: row.generated_by_user_id, generatedAt: row.generated_at, country: row.country, region: row.region, rulesPackId: row.rules_pack_id, status: row.status };
+  return { id: row.id, organizationId: row.organization_id, facilityId: row.facility_id, reviewId: row.review_id, title: row.title, fileReference: row.file_reference, generatedByUserId: row.generated_by_user_id, generatedAt: row.generated_at, country: row.country, region: row.region, rulesPackId: row.rules_pack_id, status: row.status, archived: row.archived, deletedAt: row.deleted_at, deletedByUserId: row.deleted_by_user_id, deletionReason: row.deletion_reason, retentionUntil: row.retention_until, storageDeletionStatus: row.storage_deletion_status, storageDeletionError: row.storage_deletion_error };
+}
+
+function leaseLostError(id) {
+  const error = new Error(`Processing job lease was lost for ${id}`);
+  error.code = "JOB_LEASE_LOST";
+  error.retryable = false;
+  return error;
 }
 
 function camelEvidenceMatch(row) {

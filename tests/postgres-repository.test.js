@@ -15,14 +15,19 @@ import { createEvidenceAiService } from "../apps/api/src/evidence-ai-service.js"
 import { createPrivateStorage } from "../apps/api/src/storage.js";
 
 test("postgres repository persists facilities, evidence, reviews, matches, and packets", { skip: !process.env.TEST_DATABASE_URL }, async () => {
-  const pool = await createPostgresPool(process.env.TEST_DATABASE_URL);
+  const schema = `ciq_test_${randomUUID().replaceAll("-", "")}`;
+  const adminPool = await createPostgresPool(process.env.TEST_DATABASE_URL);
+  await adminPool.query(`CREATE SCHEMA "${schema}"`);
+  const scopedUrl = new URL(process.env.TEST_DATABASE_URL);
+  scopedUrl.searchParams.set("options", `-c search_path=${schema}`);
+  const pool = await createPostgresPool(scopedUrl.toString());
   try {
     await runMigrations(pool, await loadMigrations());
   } finally {
     await pool.end();
   }
 
-  const repo = new PostgresRepository(process.env.TEST_DATABASE_URL);
+  const repo = new PostgresRepository(scopedUrl.toString());
   await repo.init();
   const suffix = randomUUID();
   try {
@@ -52,11 +57,13 @@ test("postgres repository persists facilities, evidence, reviews, matches, and p
     }, org.id, user.id));
     let generated = generateReview({ facility, evidence: [evidence], now: new Date("2026-06-18T12:00:00Z") });
     await repo.saveApplicableRules(org.id, facility.id, generated.rulesPack.rulesPackId, generated.applicableRules);
-    const job = await repo.enqueueProcessingJob({ organizationId: org.id, facilityId: facility.id, evidenceId: evidence.id, createdByUserId: user.id, maxAttempts: 3 });
+    const enqueuedJob = await repo.enqueueProcessingJob({ organizationId: org.id, facilityId: facility.id, evidenceId: evidence.id, createdByUserId: user.id, maxAttempts: 3 });
+    const job = await repo.claimNextProcessingJob({ workerId: "postgres-integration", leaseToken: randomUUID(), leaseExpiresAt: new Date(Date.now() + 60_000).toISOString() });
+    assert.equal(job.id, enqueuedJob.id);
     const aiConfig = { aiEnabled: true, aiProvider: "mock", aiMaxFileTextChars: 1_000, aiConfidenceThreshold: 0.8, aiReviewRequiredThreshold: 0.7, maxUploadMb: 1 };
     const service = createEvidenceAiService({ config: aiConfig, repo, storage, provider: new MockEvidenceAiProvider(aiConfig) });
     await service.processEvidence({ organizationId: org.id, evidenceId: evidence.id, userId: user.id, processingJobId: job.id });
-    await repo.completeProcessingJob(org.id, job.id);
+    await repo.completeProcessingJob(org.id, job.id, job.leaseToken);
     await service.reviewEvidence({ organizationId: org.id, evidenceId: evidence.id, reviewer: user, reviewInput: { action: "accept_ai", evidenceType: null, ruleId: null, notes: "Reviewed." } });
     await service.reviewEvidence({ organizationId: org.id, evidenceId: evidence.id, reviewer: user, reviewInput: { action: "mark_accepted", evidenceType: null, ruleId: null, notes: "Accepted." } });
     const persistedEvidence = await repo.getEvidence(org.id, evidence.id);
@@ -92,7 +99,7 @@ test("postgres repository persists facilities, evidence, reviews, matches, and p
     await repo.logAudit({ organizationId: org.id, facilityId: facility.id, actorUserId: user.id, action: "packet.exported", entityType: "audit_packet", entityId: packet.id });
 
     await repo.close();
-    const restarted = new PostgresRepository(process.env.TEST_DATABASE_URL);
+    const restarted = new PostgresRepository(scopedUrl.toString());
     await restarted.init();
     try {
       const persistedFacility = await restarted.getFacility(org.id, facility.id);
@@ -117,5 +124,7 @@ test("postgres repository persists facilities, evidence, reviews, matches, and p
     }
   } finally {
     await repo.close();
+    await adminPool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    await adminPool.end();
   }
 });

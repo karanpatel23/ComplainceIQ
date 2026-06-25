@@ -9,7 +9,9 @@
     "packages/*"
   ],
   "scripts": {
-    "dev": "node --env-file-if-exists=.env apps/api/src/server.js",
+    "dev": "node --env-file-if-exists=.env scripts/dev-local.mjs",
+    "dev:api": "node --env-file-if-exists=.env apps/api/src/server.js",
+    "dev:web": "node apps/web/src/static-server.js",
     "start": "node --env-file-if-exists=.env apps/api/src/server.js",
     "start:api": "node --env-file-if-exists=.env scripts/start-runtime.mjs api",
     "start:worker": "node --env-file-if-exists=.env scripts/start-runtime.mjs worker",

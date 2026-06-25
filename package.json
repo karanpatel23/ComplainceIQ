@@ -16,6 +16,7 @@
     "start:api": "node --env-file-if-exists=.env scripts/start-runtime.mjs api",
     "start:worker": "node --env-file-if-exists=.env scripts/start-runtime.mjs worker",
     "start:combined": "node --env-file-if-exists=.env scripts/start-runtime.mjs api-and-worker",
+    "build:web": "npm --workspace @complianceiq/web run build",
     "build": "npm run typecheck && npm run lint && npm --workspaces --if-present run build",
     "typecheck": "node scripts/check-js.mjs",
     "lint": "node scripts/lint.mjs",

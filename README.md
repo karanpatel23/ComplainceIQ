@@ -40,6 +40,7 @@ Required for production:
 - `PORT`
 - `APP_URL`
 - `ALLOWED_ORIGINS` without `*`
+- `WEB_API_ORIGIN` for production static frontend builds, including Vercel
 - `DATABASE_URL`
 - `REPOSITORY_BACKEND=postgres`
 - `SESSION_SECRET` with at least 32 characters
@@ -52,6 +53,7 @@ Required for production:
 Optional:
 
 - `API_HOST` (defaults to `0.0.0.0` in production)
+- `WEB_PORT`, `WEB_HOST` for the local static web server
 - `ENABLE_DEMO_DATA`
 - `ADMIN_EMAIL`
 - `ADMIN_PASSWORD`
@@ -232,28 +234,31 @@ Remove the four `PROVISION_*` values from the deployment environment after the c
 
 ## Running The App
 
-Local combined API and worker:
+Local combined API, worker, and web UI:
 
 ```bash
 npm run dev
 ```
+
+Open the `Web UI` URL printed by the launcher, usually `http://localhost:5173`. If that port is busy, the launcher selects the next open port and prints the correct URL.
 
 Separate processes:
 
 ```bash
 npm run start:api
 npm run start:worker
+npm run dev:web
 ```
 
 The API serves `/health/live` and `/health/ready`. A worker-only process serves `/health/live`, `/health/ready`, and `/metrics` on `WORKER_HEALTH_PORT`; keep that port internal.
 
-Web:
+Static web build:
 
 ```bash
-npm --workspace @complianceiq/web run dev
+WEB_API_ORIGIN=http://localhost:4000 npm run build:web
 ```
 
-Open `http://localhost:5173`. The frontend expects the API at `http://localhost:4000` by default.
+The frontend uses `WEB_API_ORIGIN` at build/runtime config generation time. Local development defaults to `http://localhost:4000`; production builds must use a deployed HTTPS API origin.
 
 ## Running Tests
 
@@ -470,15 +475,49 @@ Templates are available in `deploy/env/local.env.example`, `deploy/env/staging.e
 
 Recommended topology:
 
-1. Serve the built static web app from managed HTTPS hosting or a hardened static server/CDN.
+1. Serve the built static web app from Vercel, managed HTTPS hosting, or a hardened static server/CDN.
 2. Run `npm run start:api` behind the trusted HTTPS ingress.
 3. Run `npm run start:worker` separately with access to PostgreSQL, private storage, scanner, and optional AI provider.
 4. Point both processes at the same migrated PostgreSQL database and private bucket.
 5. Expose API health through the load balancer; keep worker health/metrics internal.
 
+### Vercel frontend deployment
+
+The root `vercel.json` is intentionally configured for the static web frontend only:
+
+- install: `npm ci`
+- build: `npm run build:web`
+- output: `apps/web/dist`
+
+Set this Vercel environment variable before deploying:
+
+```bash
+WEB_API_ORIGIN=https://your-api.example.com
+```
+
+Vercel automatically sets `NODE_ENV=production`/`VERCEL=1`; the web build fails fast if `WEB_API_ORIGIN` is missing, not HTTPS, or points at localhost. Add the Vercel web origin to the API `ALLOWED_ORIGINS` value, for example:
+
+```bash
+APP_URL=https://your-vercel-app.vercel.app
+ALLOWED_ORIGINS=https://your-vercel-app.vercel.app
+```
+
+### API and worker deployment
+
+Do not assume the current backend is a complete all-Vercel serverless deployment. The API uses a long-running Node HTTP server, signed cookie sessions, private file streaming, readiness checks, and a database-backed local scheduler boundary. The worker requires a persistent process for polling, leases, heartbeats, stale recovery, retries, and dead-letter handling. A production scanner also requires network access to a ClamAV-compatible daemon. Recommended pilot topology is therefore:
+
+- web frontend on Vercel;
+- API on a persistent Node host or container platform;
+- worker on a separate persistent Node host/container using the same release;
+- managed PostgreSQL;
+- private S3-compatible storage;
+- private ClamAV-compatible scanner service.
+
+You may deploy the API to a Vercel-compatible serverless target only after adapting the API entrypoint and proving request duration, body size, private download streaming, cookie/CORS, scanner access, and queue behavior. The worker should remain outside Vercel serverless unless replaced by a supported background-job platform.
+
 Before handling pilot evidence, run `npm run validate:postgres`, `npm run validate:storage`, `npm run validate:scanner`, and `npm run qa:pilot` in staging. The validators skip clearly when their infrastructure is absent. `VALIDATION_TARGET=production` is refused unless `ALLOW_PRODUCTION_VALIDATION=true`; validators still use isolated data or test objects.
 
-Operational go/no-go, backup/restore, scanner, incident-response, and security checks are in [PILOT_READINESS.md](./PILOT_READINESS.md). Pilot-facing upload and AI limitations are in [PILOT_DATA_POLICY.md](./PILOT_DATA_POLICY.md).
+The release-readiness report and Vercel guidance are in [DEPLOYMENT_READINESS.md](./DEPLOYMENT_READINESS.md). Operational go/no-go, backup/restore, scanner, incident-response, and security checks are in [PILOT_READINESS.md](./PILOT_READINESS.md). Pilot-facing upload and AI limitations are in [PILOT_DATA_POLICY.md](./PILOT_DATA_POLICY.md).
 
 ## Deployment Checklist
 

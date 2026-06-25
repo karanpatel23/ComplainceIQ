@@ -48,7 +48,7 @@ test("closed pilot workflow validates evidence processing, review, packet, delet
   await expect(page.getByRole("heading", { name: "Readiness Score Explanation" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Evidence Gap Matrix" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Evidence Review Queue" })).toBeVisible();
-  const actionsBeforeReview = await page.locator(".action-grid article").count();
+  await expect(page.locator(".action-grid")).toContainText("Close evidence gap: Lockout/Tagout written procedures");
   const reviewForm = evidenceCard.locator("form.ai-review-form");
   await reviewForm.locator('select[name="evidenceType"]').selectOption("loto_procedures");
   await reviewForm.locator('select[name="ruleId"]').selectOption("us-loto-procedures");
@@ -57,8 +57,8 @@ test("closed pilot workflow validates evidence processing, review, packet, delet
   await expect(evidenceCard).toContainText("Human reviewed");
   await evidenceCard.locator("form.ai-review-form").getByRole("button", { name: "Mark evidence accepted" }).click();
   await expect(evidenceCard).toContainText("accepted");
-  const actionsAfterReview = await page.locator(".action-grid article").count();
-  expect(actionsAfterReview).toBeLessThan(actionsBeforeReview);
+  await expect(page.locator(".action-grid")).not.toContainText("Close evidence gap: Lockout/Tagout written procedures");
+  await expect(page.locator("tr", { hasText: "Lockout/Tagout written procedures" })).toContainText("accepted");
 
   await page.getByRole("button", { name: "Export Packet PDF" }).click();
   await expect(page.getByRole("heading", { name: "Generated Packets" }).locator(".." )).toContainText("Industrial Audit Readiness Packet");

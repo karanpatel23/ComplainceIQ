@@ -1,4 +1,4 @@
-const API_BASE = window.localStorage.getItem("ciq_api_base") || "http://localhost:4000";
+const API_BASE = window.localStorage.getItem("ciq_api_base") || window.COMPLIANCEIQ_CONFIG?.apiBase || "http://localhost:4000";
 
 const state = {
   user: null,

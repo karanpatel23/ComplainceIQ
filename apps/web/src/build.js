@@ -1,4 +1,4 @@
-import { mkdir, copyFile } from "node:fs/promises";
+import { mkdir, copyFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -8,4 +8,5 @@ await mkdir(path.join(out, "src"), { recursive: true });
 await copyFile(path.join(root, "index.html"), path.join(out, "index.html"));
 await copyFile(path.join(root, "src/app.js"), path.join(out, "src/app.js"));
 await copyFile(path.join(root, "src/styles.css"), path.join(out, "src/styles.css"));
+await writeFile(path.join(out, "config.js"), `window.COMPLIANCEIQ_CONFIG = ${JSON.stringify({ apiBase: process.env.WEB_API_ORIGIN || "http://localhost:4000" })};\n`);
 process.stderr.write("Built static web app to apps/web/dist\n");

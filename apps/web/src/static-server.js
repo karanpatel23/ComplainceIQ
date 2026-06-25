@@ -11,7 +11,13 @@ const types = { ".html": "text/html", ".js": "text/javascript", ".css": "text/cs
 
 http.createServer(async (req, res) => {
   applySecurityHeaders(res);
-  const requested = req.url === "/" ? "/index.html" : req.url;
+  const { pathname } = new URL(req.url || "/", `http://${host}:${port}`);
+  const requested = pathname === "/" ? "/index.html" : pathname;
+  if (requested === "/config.js") {
+    res.writeHead(200, { "Content-Type": "text/javascript" });
+    res.end(`window.COMPLIANCEIQ_CONFIG = ${JSON.stringify({ apiBase: apiOrigin })};\n`);
+    return;
+  }
   const filePath = path.resolve(root, `.${requested}`);
   if (!filePath.startsWith(root)) {
     res.writeHead(403);

@@ -1,7 +1,10 @@
 import { spawn } from "node:child_process";
+import net from "node:net";
 
-const apiPort = process.env.PORT || "4000";
-const webPort = process.env.WEB_PORT || "5173";
+const requestedApiPort = Number.parseInt(process.env.PORT || "4000", 10);
+const requestedWebPort = Number.parseInt(process.env.WEB_PORT || "5173", 10);
+const apiPort = String(await findAvailablePort(requestedApiPort));
+const webPort = String(await findAvailablePort(requestedWebPort));
 const webHost = process.env.WEB_HOST || "127.0.0.1";
 const apiOrigin = process.env.WEB_API_ORIGIN || `http://localhost:${apiPort}`;
 const allowedOrigins = process.env.ALLOWED_ORIGINS || [
@@ -28,6 +31,12 @@ const children = [
 ];
 
 process.stderr.write("\nComplianceIQ local dev is starting:\n");
+if (apiPort !== String(requestedApiPort)) {
+  process.stderr.write(`  Note: API port ${requestedApiPort} was busy, using ${apiPort} instead.\n`);
+}
+if (webPort !== String(requestedWebPort)) {
+  process.stderr.write(`  Note: Web port ${requestedWebPort} was busy, using ${webPort} instead.\n`);
+}
 process.stderr.write(`  Web UI: ${localWebUrl()}\n`);
 process.stderr.write(`  API:    http://localhost:${apiPort}\n`);
 process.stderr.write("Press Ctrl+C to stop both processes.\n\n");
@@ -95,4 +104,22 @@ function stopChildren() {
 function localWebUrl() {
   const printableHost = webHost === "127.0.0.1" ? "localhost" : webHost;
   return `http://${printableHost}:${webPort}`;
+}
+
+async function findAvailablePort(startPort) {
+  for (let port = startPort; port < startPort + 50; port += 1) {
+    if (await canListen(port)) return port;
+  }
+  throw new Error(`No available port found between ${startPort} and ${startPort + 49}`);
+}
+
+function canListen(port) {
+  return new Promise((resolve) => {
+    const probe = net.createServer();
+    probe.once("error", () => resolve(false));
+    probe.once("listening", () => {
+      probe.close(() => resolve(true));
+    });
+    probe.listen(port, "127.0.0.1");
+  });
 }

@@ -1,22 +1,33 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { mkdtemp } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { PostgresRepository } from "../packages/db/src/postgres-repository.js";
 import { runMigrations } from "../packages/db/src/migration-runner.js";
 import { createPostgresPool } from "../packages/db/src/postgres-pool.js";
 import { loadMigrations } from "../packages/db/src/repository.js";
 import { parseEvidenceInput, parseFacilityInput } from "../packages/shared/src/index.js";
 import { generateReview } from "../packages/rules/src/index.js";
+import { MockEvidenceAiProvider } from "../packages/ai/src/index.js";
+import { createEvidenceAiService } from "../apps/api/src/evidence-ai-service.js";
+import { createPrivateStorage } from "../apps/api/src/storage.js";
 
 test("postgres repository persists facilities, evidence, reviews, matches, and packets", { skip: !process.env.TEST_DATABASE_URL }, async () => {
-  const pool = await createPostgresPool(process.env.TEST_DATABASE_URL);
+  const schema = `ciq_test_${randomUUID().replaceAll("-", "")}`;
+  const adminPool = await createPostgresPool(process.env.TEST_DATABASE_URL);
+  await adminPool.query(`CREATE SCHEMA "${schema}"`);
+  const scopedUrl = new URL(process.env.TEST_DATABASE_URL);
+  scopedUrl.searchParams.set("options", `-c search_path=${schema}`);
+  const pool = await createPostgresPool(scopedUrl.toString());
   try {
     await runMigrations(pool, await loadMigrations());
   } finally {
     await pool.end();
   }
 
-  const repo = new PostgresRepository(process.env.TEST_DATABASE_URL);
+  const repo = new PostgresRepository(scopedUrl.toString());
   await repo.init();
   const suffix = randomUUID();
   try {
@@ -32,26 +43,32 @@ test("postgres repository persists facilities, evidence, reviews, matches, and p
       employeeCount: 40,
       hazardProfile: { machinery: true, lockoutTagout: true }
     }, org.id));
+    const storage = createPrivateStorage({ storageBackend: "local", uploadStorageBackend: "local", uploadDir: await mkdtemp(path.join(os.tmpdir(), "ciq-pg-storage-")), maxUploadMb: 1 });
+    const saved = await storage.saveBuffer(Buffer.from("Lockout Tagout procedure 2026-01-01"), "loto.txt");
     const evidence = await repo.createEvidence(parseEvidenceInput({
       facilityId: facility.id,
       title: "LOTO procedure",
-      evidenceType: "loto_procedures",
-      status: "accepted"
+      evidenceType: "other",
+      status: "pending",
+      fileReference: saved.fileReference,
+      fileName: "loto.txt",
+      fileSha256: saved.sha256,
+      scanStatus: "scan_clean"
     }, org.id, user.id));
-    const generated = generateReview({ facility, evidence: [evidence], now: new Date("2026-06-18T12:00:00Z") });
+    let generated = generateReview({ facility, evidence: [evidence], now: new Date("2026-06-18T12:00:00Z") });
     await repo.saveApplicableRules(org.id, facility.id, generated.rulesPack.rulesPackId, generated.applicableRules);
-    await repo.upsertAiAnalysis({
-      organizationId: org.id, facilityId: facility.id, evidenceId: evidence.id, reviewId: null,
-      processingStatus: "processed", textExtractionStatus: "extracted", detectedEvidenceType: "loto_procedures",
-      detectedTitle: "LOTO procedure", extractedDocumentDate: "2026-01-01", extractedExpirationDate: null,
-      extractedFacilityName: null, extractedEmployeeNames: [], extractedEquipmentNames: [], extractedChemicalNames: [],
-      extractedSignaturePresent: null, extractedAuthorityMentions: [], extractedCitationMentions: [], summary: "LOTO evidence",
-      issues: [], suggestedRuleId: "us-loto-procedures", suggestedObligationTitle: "Lockout/Tagout written procedures",
-      matchReason: "Type agreement", missingFieldsOrIssues: [], confidence: 0.9, needsHumanReview: false,
-      provider: "mock", model: "mock-evidence-v1", promptVersion: "evidence-intelligence-v1",
-      rawModelOutputReference: null, error: null, humanReviewed: false, humanAcceptedAiResult: false,
-      humanReviewerId: null, humanReviewedAt: null, humanOverrideEvidenceType: null, humanOverrideRuleId: null, humanReviewNotes: null
-    });
+    const enqueuedJob = await repo.enqueueProcessingJob({ organizationId: org.id, facilityId: facility.id, evidenceId: evidence.id, createdByUserId: user.id, maxAttempts: 3 });
+    const job = await repo.claimNextProcessingJob({ workerId: "postgres-integration", leaseToken: randomUUID(), leaseExpiresAt: new Date(Date.now() + 60_000).toISOString() });
+    assert.equal(job.id, enqueuedJob.id);
+    const aiConfig = { aiEnabled: true, aiProvider: "mock", aiMaxFileTextChars: 1_000, aiConfidenceThreshold: 0.8, aiReviewRequiredThreshold: 0.7, maxUploadMb: 1 };
+    const service = createEvidenceAiService({ config: aiConfig, repo, storage, provider: new MockEvidenceAiProvider(aiConfig) });
+    await service.processEvidence({ organizationId: org.id, evidenceId: evidence.id, userId: user.id, processingJobId: job.id });
+    await repo.completeProcessingJob(org.id, job.id, job.leaseToken);
+    await service.reviewEvidence({ organizationId: org.id, evidenceId: evidence.id, reviewer: user, reviewInput: { action: "accept_ai", evidenceType: null, ruleId: null, notes: "Reviewed." } });
+    await service.reviewEvidence({ organizationId: org.id, evidenceId: evidence.id, reviewer: user, reviewInput: { action: "mark_accepted", evidenceType: null, ruleId: null, notes: "Accepted." } });
+    const persistedEvidence = await repo.getEvidence(org.id, evidence.id);
+    const persistedAnalysis = await repo.getAiAnalysis(org.id, evidence.id);
+    generated = generateReview({ facility, evidence: [persistedEvidence], aiAnalyses: [persistedAnalysis], now: new Date("2026-06-18T12:00:00Z") });
     const review = await repo.createReview({
       organizationId: org.id,
       facilityId: facility.id,
@@ -82,7 +99,7 @@ test("postgres repository persists facilities, evidence, reviews, matches, and p
     await repo.logAudit({ organizationId: org.id, facilityId: facility.id, actorUserId: user.id, action: "packet.exported", entityType: "audit_packet", entityId: packet.id });
 
     await repo.close();
-    const restarted = new PostgresRepository(process.env.TEST_DATABASE_URL);
+    const restarted = new PostgresRepository(scopedUrl.toString());
     await restarted.init();
     try {
       const persistedFacility = await restarted.getFacility(org.id, facility.id);
@@ -96,12 +113,18 @@ test("postgres repository persists facilities, evidence, reviews, matches, and p
       assert.equal((await restarted.getActionItems(org.id, review.id)).length, generated.actionPlan.length);
       assert.ok((await restarted.getEvidenceMatches(org.id, facility.id)).some((match) => match.evidenceId === evidence.id));
       assert.equal((await restarted.getAiAnalysis(org.id, evidence.id)).detectedEvidenceType, "loto_procedures");
+      assert.equal((await restarted.getAiAnalysisHistory(org.id, evidence.id))[0].analysisVersion, 1);
+      assert.equal((await restarted.listProcessingJobs(org.id, facility.id))[0].status, "completed");
       assert.equal((await restarted.listAuditPackets(org.id, facility.id))[0].id, packet.id);
       assert.ok((await restarted.listAuditLogs(org.id, facility.id)).some((entry) => entry.action === "packet.exported"));
+      const otherOrg = await restarted.createOrganization({ name: `Other ${suffix}` });
+      await assert.rejects(() => restarted.getAiAnalysis(otherOrg.id, evidence.id), /another organization/);
     } finally {
       await restarted.close();
     }
   } finally {
     await repo.close();
+    await adminPool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    await adminPool.end();
   }
 });

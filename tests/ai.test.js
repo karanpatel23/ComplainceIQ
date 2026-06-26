@@ -40,11 +40,11 @@ test("AI providers validate taxonomy, JSON, confidence, and bounded extraction",
   }, async () => ({ ok: true, status: 200, json: async () => ({ output_text: "not-json" }) }));
   await assert.rejects(() => openai.analyzeEvidenceDocument({ text: "text", evidence: {}, facility: {}, applicableRules }), /not valid JSON/);
 
-  const extracted = extractEvidenceText({ buffer: Buffer.from("a".repeat(100)), fileName: "record.txt", evidence: { title: "Record" }, maxChars: 20 });
+  const extracted = await extractEvidenceText({ buffer: Buffer.from("a".repeat(100)), fileName: "record.txt", evidence: { title: "Record" }, maxChars: 20 });
   assert.equal(extracted.text.length, 20);
   assert.equal(extracted.truncated, true);
-  const unsupported = extractEvidenceText({ buffer: Buffer.from("%PDF"), fileName: "scan.pdf", evidence: { title: "Scan" }, maxChars: 100 });
-  assert.equal(unsupported.textExtractionStatus, "unsupported_for_text_extraction");
+  const unsupported = await extractEvidenceText({ buffer: Buffer.from("%PDF"), fileName: "scan.pdf", evidence: { title: "Scan" }, maxChars: 100 });
+  assert.equal(unsupported.textExtractionStatus, "extraction_failed");
 });
 
 test("AI processing is auditable and human override wins over AI and deterministic suggestions", async () => {
@@ -76,10 +76,13 @@ test("AI processing is auditable and human override wins over AI and determinist
   const provider = new MockEvidenceAiProvider(aiConfig);
   const service = createEvidenceAiService({ config: aiConfig, repo, storage, provider });
 
-  const analysis = await service.processEvidence({ organizationId: org.id, evidenceId: evidence.id, userId: reviewer.id });
+  const job = await repo.enqueueProcessingJob({ organizationId: org.id, facilityId: facility.id, evidenceId: evidence.id, createdByUserId: reviewer.id, maxAttempts: 3 });
+  const analysis = await service.processEvidence({ organizationId: org.id, evidenceId: evidence.id, userId: reviewer.id, processingJobId: job.id });
   assert.equal(analysis.processingStatus, "processed");
   assert.equal(analysis.detectedEvidenceType, "loto_procedures");
   assert.equal(analysis.needsHumanReview, false);
+  assert.equal((await service.processEvidence({ organizationId: org.id, evidenceId: evidence.id, userId: reviewer.id, processingJobId: job.id })).id, analysis.id);
+  assert.equal((await repo.getAiAnalysisHistory(org.id, evidence.id)).length, 1);
 
   const beforeReview = generateReview({ facility, evidence: [evidence], aiAnalyses: [analysis], now: new Date("2026-06-19T12:00:00Z") });
   assert.equal(beforeReview.gapRows.find((row) => row.ruleId === "us-loto-procedures").status, "missing");
@@ -105,12 +108,16 @@ test("AI processing is auditable and human override wins over AI and determinist
   assert.equal(overridden.gapRows.find((row) => row.ruleId === "us-loto-procedures").status, "missing");
   assert.equal(overridden.gapRows.find((row) => row.ruleId === "us-ppe-training").status, "accepted");
 
+  await service.reviewEvidence({ organizationId: org.id, evidenceId: evidence.id, reviewer, reviewInput: { action: "request_more_evidence", evidenceType: null, ruleId: null, notes: "Provide the signed roster." } });
+  assert.equal((await repo.getEvidence(org.id, evidence.id)).status, "needs_review");
+
   const logs = await repo.listAuditLogs(org.id, facility.id);
   assert.ok(logs.some((entry) => entry.action === "evidence_processing_started"));
   assert.ok(logs.some((entry) => entry.action === "ai_match_suggested"));
   assert.ok(logs.some((entry) => entry.action === "human_accepted_ai_result"));
   assert.ok(logs.some((entry) => entry.action === "human_overrode_evidence_type"));
   assert.ok(logs.some((entry) => entry.action === "human_overrode_rule_match" && entry.metadata.overrideRuleId === "us-ppe-training"));
+  assert.ok(logs.some((entry) => entry.action === "human_requested_more_evidence"));
 
   const otherOrg = await repo.createOrganization({ name: "Other Tenant" });
   await assert.rejects(() => repo.getAiAnalysis(otherOrg.id, evidence.id), /another organization/);
@@ -152,6 +159,10 @@ test("medium confidence requires review and invalid provider output is persisted
   const invalidService = createEvidenceAiService({ config: aiConfig, repo, storage, provider: invalidProvider });
   await assert.rejects(() => invalidService.processEvidence({ organizationId: org.id, evidenceId: evidence.id, userId: user.id }), /detectedEvidenceType/);
   assert.equal((await repo.getAiAnalysis(org.id, evidence.id)).processingStatus, "failed");
+  const history = await repo.getAiAnalysisHistory(org.id, evidence.id);
+  assert.deepEqual(history.map((item) => item.analysisVersion), [3, 2, 1]);
+  assert.equal(history[0].isCurrent, true);
+  assert.equal(history[1].isCurrent, false);
   assert.ok((await repo.listAuditLogs(org.id, facility.id)).some((entry) => entry.action === "ai_output_rejected_invalid_schema"));
 });
 

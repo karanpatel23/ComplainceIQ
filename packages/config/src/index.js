@@ -26,16 +26,30 @@ export function readRepositoryConfig(env = process.env) {
 export function readConfig(env = process.env) {
   const repositoryConfig = readRepositoryConfig(env);
   const { nodeEnv, isProduction, repositoryBackend } = repositoryConfig;
+  const deploymentProfile = env.DEPLOYMENT_PROFILE || (isProduction ? "" : "local");
+  if (!["local", "staging", "closed-pilot"].includes(deploymentProfile)) {
+    throw new Error("DEPLOYMENT_PROFILE must be local, staging, or closed-pilot and must be explicit in production");
+  }
+  const isSecureDeployment = deploymentProfile !== "local";
+  if (isSecureDeployment && !isProduction) throw new Error(`${deploymentProfile} requires NODE_ENV=production`);
+  if (isProduction && deploymentProfile === "local") throw new Error("DEPLOYMENT_PROFILE=local is not allowed in production");
+  const processRole = env.PROCESS_ROLE || (deploymentProfile === "local" ? "api-and-worker" : "");
+  if (!["api", "worker", "api-and-worker"].includes(processRole)) {
+    throw new Error("PROCESS_ROLE must be api, worker, or api-and-worker and must be explicit outside local development");
+  }
+  if (isSecureDeployment && processRole === "api-and-worker") {
+    throw new Error("PROCESS_ROLE=api-and-worker is limited to local development; deploy separate api and worker processes");
+  }
   const allowedOrigins = (env.ALLOWED_ORIGINS || "http://localhost:5173,http://localhost:4000")
     .split(",")
     .map((origin) => origin.trim())
     .filter(Boolean);
 
-  if (isProduction) {
-    const required = ["PORT", "APP_URL", "ALLOWED_ORIGINS", "DATABASE_URL", "SESSION_SECRET", "UPLOAD_STORAGE_BACKEND", "UPLOAD_DIR", "MAX_UPLOAD_MB"];
+  if (isSecureDeployment) {
+    const required = ["DEPLOYMENT_PROFILE", "PROCESS_ROLE", "PORT", "APP_URL", "ALLOWED_ORIGINS", "DATABASE_URL", "SESSION_SECRET", "STORAGE_BACKEND", "MAX_UPLOAD_MB"];
     const missing = required.filter((name) => !env[name]);
     if (missing.length > 0) {
-      throw new Error(`Missing required production environment variables: ${missing.join(", ")}`);
+      throw new Error(`Missing required ${deploymentProfile} environment variables: ${missing.join(", ")}`);
     }
   }
 
@@ -45,24 +59,25 @@ export function readConfig(env = process.env) {
     throw new Error("PORT must be an integer between 1 and 65535");
   }
 
-  if (isProduction && allowedOrigins.includes("*")) {
+  if (isSecureDeployment && allowedOrigins.includes("*")) {
     throw new Error("ALLOWED_ORIGINS must not include * in production");
   }
 
-  if (isProduction) {
+  if (isSecureDeployment) {
     try {
-      new URL(env.APP_URL);
-      for (const origin of allowedOrigins) new URL(origin);
+      const appUrl = new URL(env.APP_URL);
+      const originUrls = allowedOrigins.map((origin) => new URL(origin));
+      if (appUrl.protocol !== "https:" || originUrls.some((origin) => origin.protocol !== "https:")) throw new Error("HTTPS required");
     } catch {
-      throw new Error("APP_URL and ALLOWED_ORIGINS must contain valid absolute URLs in production");
+      throw new Error("APP_URL and ALLOWED_ORIGINS must contain valid absolute HTTPS URLs in production");
     }
   }
 
-  if (isProduction && (!env.SESSION_SECRET || env.SESSION_SECRET.length < 32)) {
+  if (isSecureDeployment && (!env.SESSION_SECRET || env.SESSION_SECRET.length < 32)) {
     throw new Error("SESSION_SECRET is required in production and must be at least 32 characters");
   }
 
-  if (isProduction && env.ENABLE_DEMO_DATA === "true") {
+  if (isSecureDeployment && env.ENABLE_DEMO_DATA === "true") {
     throw new Error("ENABLE_DEMO_DATA must not be true in production");
   }
 
@@ -70,6 +85,49 @@ export function readConfig(env = process.env) {
   if (!Number.isInteger(maxUploadMb) || maxUploadMb <= 0) {
     throw new Error("MAX_UPLOAD_MB must be a positive integer");
   }
+
+  const storageBackend = env.STORAGE_BACKEND || env.UPLOAD_STORAGE_BACKEND || "local";
+  if (!["local", "s3"].includes(storageBackend)) throw new Error("STORAGE_BACKEND must be local or s3");
+  if (isSecureDeployment && storageBackend !== "s3") throw new Error(`STORAGE_BACKEND must be s3 for ${deploymentProfile}`);
+  if (storageBackend === "s3" && (!env.S3_BUCKET || !env.S3_REGION)) {
+    throw new Error("S3_BUCKET and S3_REGION are required when STORAGE_BACKEND=s3");
+  }
+  if (Boolean(env.S3_ACCESS_KEY_ID) !== Boolean(env.S3_SECRET_ACCESS_KEY)) {
+    throw new Error("S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY must be configured together");
+  }
+
+  const queueBackend = env.QUEUE_BACKEND || "local";
+  if (queueBackend !== "local") throw new Error("QUEUE_BACKEND currently supports local only");
+  const queueConcurrency = boundedInteger(env.QUEUE_CONCURRENCY || "1", "QUEUE_CONCURRENCY", 1, 16);
+  const queueMaxRetries = boundedInteger(env.QUEUE_MAX_RETRIES || "3", "QUEUE_MAX_RETRIES", 1, 10);
+  const queueLeaseMs = boundedInteger(env.QUEUE_LEASE_MS || "300000", "QUEUE_LEASE_MS", 5_000, 3_600_000);
+  const queueHeartbeatMs = boundedInteger(env.QUEUE_HEARTBEAT_MS || "30000", "QUEUE_HEARTBEAT_MS", 1_000, 300_000);
+  const queuePollMs = boundedInteger(env.QUEUE_POLL_MS || "1000", "QUEUE_POLL_MS", 100, 60_000);
+  const queueShutdownTimeoutMs = boundedInteger(env.QUEUE_SHUTDOWN_TIMEOUT_MS || "30000", "QUEUE_SHUTDOWN_TIMEOUT_MS", 1_000, 300_000);
+  if (queueHeartbeatMs >= queueLeaseMs) throw new Error("QUEUE_HEARTBEAT_MS must be less than QUEUE_LEASE_MS");
+
+  const malwareScanEnabled = env.MALWARE_SCAN_ENABLED === "true";
+  const malwareScanRequiredInProduction = env.MALWARE_SCAN_REQUIRED_IN_PRODUCTION === "true";
+  const malwareScannerProvider = env.MALWARE_SCANNER_PROVIDER || "mock";
+  const malwareScanTimeoutMs = boundedInteger(env.CLAMAV_TIMEOUT_MS || env.MALWARE_SCAN_TIMEOUT_MS || "10000", "CLAMAV_TIMEOUT_MS", 100, 120_000);
+  const malwareScanFailPolicy = env.MALWARE_SCAN_FAIL_POLICY || (isSecureDeployment ? "closed" : "open");
+  const clamavHost = env.CLAMAV_HOST || "127.0.0.1";
+  const clamavPort = boundedInteger(env.CLAMAV_PORT || "3310", "CLAMAV_PORT", 1, 65_535);
+  if (!["mock", "clamav"].includes(malwareScannerProvider)) throw new Error("MALWARE_SCANNER_PROVIDER must be mock or clamav");
+  if (!["open", "closed"].includes(malwareScanFailPolicy)) throw new Error("MALWARE_SCAN_FAIL_POLICY must be open or closed");
+  if (isSecureDeployment && malwareScanEnabled && malwareScannerProvider === "mock") {
+    throw new Error("MALWARE_SCANNER_PROVIDER=mock is not allowed in production");
+  }
+  if (isSecureDeployment && malwareScanRequiredInProduction && (!malwareScanEnabled || malwareScannerProvider !== "clamav" || malwareScanFailPolicy !== "closed")) {
+    throw new Error("Production-required malware scanning needs an enabled non-mock scanner adapter");
+  }
+  if (deploymentProfile === "closed-pilot" && (!malwareScanEnabled || !malwareScanRequiredInProduction || malwareScannerProvider !== "clamav" || malwareScanFailPolicy !== "closed")) {
+    throw new Error("closed-pilot requires enabled, required, fail-closed ClamAV scanning");
+  }
+
+  const trustProxy = env.TRUST_PROXY === "true";
+  const sessionCookieSameSite = (env.SESSION_COOKIE_SAME_SITE || (isSecureDeployment ? "None" : "Lax")).toLowerCase();
+  if (!["lax", "strict", "none"].includes(sessionCookieSameSite)) throw new Error("SESSION_COOKIE_SAME_SITE must be Lax, Strict, or None");
 
   const aiEnabled = env.AI_ENABLED === "true";
   const aiProvider = env.AI_PROVIDER || "openai";
@@ -82,26 +140,61 @@ export function readConfig(env = process.env) {
   if (aiEnabled && !["openai", "mock"].includes(aiProvider)) {
     throw new Error("AI_PROVIDER must be openai or mock when AI is enabled");
   }
-  if (isProduction && aiEnabled && aiProvider === "mock") {
+  if (isSecureDeployment && aiEnabled && aiProvider === "mock") {
     throw new Error("AI_PROVIDER=mock is not allowed in production");
   }
   if (aiEnabled && aiProvider === "openai" && (!env.OPENAI_API_KEY || !env.OPENAI_MODEL)) {
     throw new Error("OPENAI_API_KEY and OPENAI_MODEL are required when AI_ENABLED=true and AI_PROVIDER=openai");
   }
 
+  const logLevel = env.LOG_LEVEL || "info";
+  if (!["debug", "info", "warn", "error"].includes(logLevel)) throw new Error("LOG_LEVEL must be debug, info, warn, or error");
+
   return {
     nodeEnv,
     isProduction,
+    deploymentProfile,
+    isSecureDeployment,
+    processRole,
+    runsApi: ["api", "api-and-worker"].includes(processRole),
+    runsWorker: ["worker", "api-and-worker"].includes(processRole),
+    logLevel,
     port,
     apiHost: env.API_HOST || (isProduction ? "0.0.0.0" : "127.0.0.1"),
+    workerHealthPort: boundedInteger(env.WORKER_HEALTH_PORT || "4001", "WORKER_HEALTH_PORT", 1, 65_535),
+    workerHealthHost: env.WORKER_HEALTH_HOST || (isProduction ? "0.0.0.0" : "127.0.0.1"),
     appUrl: env.APP_URL || "http://localhost:5173",
     allowedOrigins,
     databaseUrl: repositoryConfig.databaseUrl,
     repositoryBackend,
     sessionSecret: env.SESSION_SECRET || "development-only-session-secret-change-me",
-    uploadStorageBackend: env.UPLOAD_STORAGE_BACKEND || "local",
+    storageBackend,
+    uploadStorageBackend: storageBackend,
     uploadDir: env.UPLOAD_DIR || "data/private-storage",
     maxUploadMb,
+    s3Bucket: env.S3_BUCKET || "",
+    s3Region: env.S3_REGION || "",
+    s3Endpoint: env.S3_ENDPOINT || "",
+    s3AccessKeyId: env.S3_ACCESS_KEY_ID || "",
+    s3SecretAccessKey: env.S3_SECRET_ACCESS_KEY || "",
+    s3ForcePathStyle: env.S3_FORCE_PATH_STYLE === "true",
+    signedUrlExpirySeconds: boundedInteger(env.SIGNED_URL_EXPIRY_SECONDS || "300", "SIGNED_URL_EXPIRY_SECONDS", 60, 3_600),
+    queueBackend,
+    queueConcurrency,
+    queueMaxRetries,
+    queueLeaseMs,
+    queueHeartbeatMs,
+    queuePollMs,
+    queueShutdownTimeoutMs,
+    malwareScanEnabled,
+    malwareScanRequiredInProduction,
+    malwareScannerProvider,
+    malwareScanTimeoutMs,
+    malwareScanFailPolicy,
+    clamavHost,
+    clamavPort,
+    trustProxy,
+    sessionCookieSameSite: sessionCookieSameSite[0].toUpperCase() + sessionCookieSameSite.slice(1),
     enableDemoData: env.ENABLE_DEMO_DATA === "true",
     adminEmail: env.ADMIN_EMAIL || "admin@complianceiq.local",
     adminPassword: env.ADMIN_PASSWORD || "",
@@ -124,5 +217,11 @@ function positiveInteger(value, name) {
 function unitInterval(value, name) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) throw new Error(`${name} must be between 0 and 1`);
+  return parsed;
+}
+
+function boundedInteger(value, name, min, max) {
+  const parsed = Number.parseInt(String(value), 10);
+  if (!Number.isInteger(parsed) || parsed < min || parsed > max) throw new Error(`${name} must be an integer between ${min} and ${max}`);
   return parsed;
 }

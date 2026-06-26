@@ -70,7 +70,7 @@ export function validateEvidenceAiOutput(input, { applicableRules = [], reviewRe
 }
 
 export function parseAiReviewInput(input) {
-  const reviewActions = ["accept_ai", "override", "mark_accepted", "mark_rejected", "mark_needs_review"];
+  const reviewActions = ["accept_ai", "override", "mark_accepted", "mark_rejected", "mark_needs_review", "request_more_evidence"];
   if (typeof input.action !== "string" || !reviewActions.includes(input.action)) throw validationError(`action must be one of: ${reviewActions.join(", ")}`);
   const action = input.action;
   const evidenceType = input.evidenceType === undefined || input.evidenceType === null || input.evidenceType === ""

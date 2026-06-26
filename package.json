@@ -9,21 +9,41 @@
     "packages/*"
   ],
   "scripts": {
-    "dev": "node --env-file-if-exists=.env apps/api/src/server.js",
+    "dev": "node --env-file-if-exists=.env scripts/dev-local.mjs",
+    "dev:api": "node --env-file-if-exists=.env apps/api/src/server.js",
+    "dev:web": "node apps/web/src/static-server.js",
     "start": "node --env-file-if-exists=.env apps/api/src/server.js",
+    "start:api": "node --env-file-if-exists=.env scripts/start-runtime.mjs api",
+    "start:worker": "node --env-file-if-exists=.env scripts/start-runtime.mjs worker",
+    "start:combined": "node --env-file-if-exists=.env scripts/start-runtime.mjs api-and-worker",
+    "build:web": "npm --workspace @complianceiq/web run build",
     "build": "npm run typecheck && npm run lint && npm --workspaces --if-present run build",
     "typecheck": "node scripts/check-js.mjs",
     "lint": "node scripts/lint.mjs",
     "pdf:fixture": "node scripts/generate-ai-packet-fixture.mjs",
     "test": "node --test tests/*.test.js",
+    "test:e2e": "playwright test",
+    "qa:pilot": "playwright test tests/e2e/pilot-smoke.spec.js",
+    "validate:postgres": "node --env-file-if-exists=.env scripts/validate-postgres.mjs",
+    "validate:storage": "node --env-file-if-exists=.env scripts/validate-storage.mjs",
+    "validate:scanner": "node --env-file-if-exists=.env scripts/validate-scanner.mjs",
+    "scan:claims": "node scripts/lint.mjs",
+    "scan:random": "node --test tests/no-random.test.js",
     "db:migrate": "node --env-file-if-exists=.env packages/db/src/migrate.js",
     "admin:provision": "node --env-file-if-exists=.env packages/db/src/provision-admin.js",
-    "seed:demo": "node --env-file-if-exists=.env packages/db/src/seed.js"
+    "seed:demo": "node --env-file-if-exists=.env packages/db/src/seed.js",
+    "seed:pilot": "node --env-file-if-exists=.env packages/db/src/seed-pilot.js"
   },
   "engines": {
     "node": ">=20.0.0"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.888.0",
+    "@aws-sdk/s3-request-presigner": "^3.1075.0",
+    "pdf-parse": "^2.4.5",
     "pg": "^8.16.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.61.1"
   }
 }

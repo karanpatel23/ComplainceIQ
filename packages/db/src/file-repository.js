@@ -14,6 +14,7 @@ const TABLES = [
   "facilities",
   "facilityApplicableRules",
   "evidence",
+  "processingJobs",
   "evidenceAiAnalyses",
   "evidenceMatches",
   "reviews",
@@ -43,7 +44,41 @@ export class FileRepository {
       this.data = Object.fromEntries(TABLES.map((table) => [table, []]));
       await this.persist();
     }
+    this.normalizeLegacyData();
     await this.seedRules();
+  }
+
+  normalizeLegacyData() {
+    for (const evidence of this.data.evidence) {
+      if (!evidence.scanStatus) evidence.scanStatus = "scan_unavailable";
+      evidence.fileValidationStatus ||= evidence.fileReference ? "legacy_unverified" : "not_applicable";
+      evidence.storageDeletionStatus ||= evidence.fileReference ? "retained" : "not_applicable";
+    }
+    for (const packet of this.data.auditPackets) {
+      packet.archived ??= false;
+      packet.storageDeletionStatus ||= packet.fileReference ? "retained" : "deleted";
+    }
+    for (const job of this.data.processingJobs) {
+      job.workerId ??= null;
+      job.leaseToken ??= null;
+      job.leaseExpiresAt ??= null;
+      job.heartbeatAt ??= null;
+      job.deadLetteredAt ??= null;
+    }
+    const byEvidence = new Map();
+    for (const analysis of this.data.evidenceAiAnalyses) {
+      if (!byEvidence.has(analysis.evidenceId)) byEvidence.set(analysis.evidenceId, []);
+      byEvidence.get(analysis.evidenceId).push(analysis);
+    }
+    for (const analyses of byEvidence.values()) {
+      analyses.sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
+      analyses.forEach((analysis, index) => {
+        analysis.analysisVersion ||= index + 1;
+        analysis.previousAnalysisId ??= index > 0 ? analyses[index - 1].id : null;
+        analysis.createdByType ||= "system";
+        analysis.isCurrent = index === analyses.length - 1;
+      });
+    }
   }
 
   async persist() {
@@ -168,6 +203,10 @@ export class FileRepository {
     return this.data.evidence.filter((row) => row.organizationId === organizationId && row.facilityId === facilityId && !row.archived);
   }
 
+  async listOrganizationEvidence(organizationId) {
+    return this.data.evidence.filter((row) => row.organizationId === organizationId && !row.archived);
+  }
+
   async getEvidence(organizationId, id) {
     return this.getScoped("evidence", organizationId, id, "Evidence");
   }
@@ -179,21 +218,41 @@ export class FileRepository {
     return row;
   }
 
-  async archiveEvidence(organizationId, id) {
-    return this.updateEvidence(organizationId, id, { archived: true });
+  async archiveEvidence(organizationId, id, deletion = {}) {
+    if (deletion.deletedByUserId) await this.assertUserOrganization(deletion.deletedByUserId, organizationId, "Deletion actor");
+    return this.updateEvidence(organizationId, id, { archived: true, ...deletion });
   }
 
   async upsertAiAnalysis(input) {
     const evidence = await this.getEvidence(input.organizationId, input.evidenceId);
     if (evidence.facilityId !== input.facilityId) throw forbidden("AI analysis facility does not match the evidence facility");
-    const existing = this.data.evidenceAiAnalyses.find((row) => row.evidenceId === input.evidenceId);
+    const existing = input.id
+      ? this.data.evidenceAiAnalyses.find((row) => row.id === input.id)
+      : input.processingJobId
+        ? this.data.evidenceAiAnalyses.find((row) => row.processingJobId === input.processingJobId)
+        : null;
     if (existing && existing.organizationId !== input.organizationId) throw forbidden("AI analysis belongs to another organization");
     if (existing) {
       Object.assign(existing, input, { id: existing.id, createdAt: existing.createdAt, updatedAt: nowIso() });
       await this.persist();
       return existing;
     }
-    const row = { id: input.id || this.createId(), createdAt: nowIso(), updatedAt: nowIso(), ...input };
+    const previous = this.data.evidenceAiAnalyses
+      .filter((row) => row.organizationId === input.organizationId && row.evidenceId === input.evidenceId)
+      .sort((a, b) => (b.analysisVersion || 1) - (a.analysisVersion || 1))[0] || null;
+    const row = {
+      id: this.createId(),
+      analysisVersion: (previous?.analysisVersion || 0) + 1,
+      previousAnalysisId: previous?.id || null,
+      createdByType: input.createdByType || "system",
+      isCurrent: true,
+      supersededAt: null,
+      supersededById: null,
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+      ...input
+    };
+    if (previous) Object.assign(previous, { isCurrent: false, supersededAt: nowIso(), supersededById: row.id, updatedAt: nowIso() });
     this.data.evidenceAiAnalyses.push(row);
     await this.persist();
     return row;
@@ -201,14 +260,157 @@ export class FileRepository {
 
   async getAiAnalysis(organizationId, evidenceId) {
     await this.getEvidence(organizationId, evidenceId);
-    return this.data.evidenceAiAnalyses.find((row) => row.organizationId === organizationId && row.evidenceId === evidenceId) || null;
+    return this.data.evidenceAiAnalyses
+      .filter((row) => row.organizationId === organizationId && row.evidenceId === evidenceId)
+      .sort((a, b) => Number(b.isCurrent) - Number(a.isCurrent) || (b.analysisVersion || 1) - (a.analysisVersion || 1))[0] || null;
+  }
+
+  async getAiAnalysisByJobId(organizationId, processingJobId) {
+    const row = this.data.evidenceAiAnalyses.find((item) => item.processingJobId === processingJobId);
+    if (!row) return null;
+    if (row.organizationId !== organizationId) throw forbidden("AI analysis belongs to another organization");
+    return row;
+  }
+
+  async getAiAnalysisHistory(organizationId, evidenceId) {
+    await this.getEvidence(organizationId, evidenceId);
+    return this.data.evidenceAiAnalyses
+      .filter((row) => row.organizationId === organizationId && row.evidenceId === evidenceId)
+      .sort((a, b) => (b.analysisVersion || 1) - (a.analysisVersion || 1));
   }
 
   async listAiAnalyses(organizationId, facilityId) {
     await this.getFacility(organizationId, facilityId);
     return this.data.evidenceAiAnalyses
-      .filter((row) => row.organizationId === organizationId && row.facilityId === facilityId)
+      .filter((row) => row.organizationId === organizationId && row.facilityId === facilityId && row.isCurrent !== false)
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  async listOrganizationAiAnalyses(organizationId) {
+    return this.data.evidenceAiAnalyses
+      .filter((row) => row.organizationId === organizationId && row.isCurrent !== false)
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  async enqueueProcessingJob(input) {
+    const evidence = await this.getEvidence(input.organizationId, input.evidenceId);
+    if (evidence.facilityId !== input.facilityId) throw forbidden("Processing job facility does not match evidence");
+    const active = this.data.processingJobs.find((row) => row.organizationId === input.organizationId && row.evidenceId === input.evidenceId && ["queued", "processing"].includes(row.status));
+    if (active) return { ...active, duplicate: true };
+    const now = nowIso();
+    const row = {
+      id: input.id || this.createId(),
+      organizationId: input.organizationId,
+      facilityId: input.facilityId,
+      evidenceId: input.evidenceId,
+      status: "queued",
+      processingAttempts: 0,
+      maxAttempts: input.maxAttempts,
+      lastProcessingError: null,
+      processingStartedAt: null,
+      processingCompletedAt: null,
+      nextRetryAt: null,
+      createdByUserId: input.createdByUserId || null,
+      createdAt: now,
+      updatedAt: now
+    };
+    this.data.processingJobs.push(row);
+    await this.persist();
+    return row;
+  }
+
+  async getProcessingJob(organizationId, id) {
+    return this.getScoped("processingJobs", organizationId, id, "Processing job");
+  }
+
+  async listProcessingJobs(organizationId, facilityId = null) {
+    if (facilityId) await this.getFacility(organizationId, facilityId);
+    return this.data.processingJobs
+      .filter((row) => row.organizationId === organizationId && (!facilityId || row.facilityId === facilityId))
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  async claimNextProcessingJob({ workerId = `worker-${process.pid}`, leaseToken = this.createId(), leaseExpiresAt = new Date(Date.now() + 300_000).toISOString() } = {}) {
+    const now = Date.now();
+    const job = this.data.processingJobs
+      .filter((row) => row.status === "queued" && (!row.nextRetryAt || new Date(row.nextRetryAt).getTime() <= now))
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt))[0];
+    if (!job) return null;
+    Object.assign(job, {
+      status: "processing",
+      processingAttempts: job.processingAttempts + 1,
+      processingStartedAt: nowIso(),
+      nextRetryAt: null,
+      workerId,
+      leaseToken,
+      leaseExpiresAt,
+      heartbeatAt: nowIso(),
+      updatedAt: nowIso()
+    });
+    await this.persist();
+    return { ...job };
+  }
+
+  async heartbeatProcessingJob(organizationId, id, { leaseToken, leaseExpiresAt }) {
+    const job = await this.getProcessingJob(organizationId, id);
+    if (job.status !== "processing" || job.leaseToken !== leaseToken) throw leaseLostError(id);
+    Object.assign(job, { heartbeatAt: nowIso(), leaseExpiresAt, updatedAt: nowIso() });
+    await this.persist();
+    return { ...job };
+  }
+
+  async recoverStaleProcessingJobs(expiredBefore = nowIso()) {
+    let changed = false;
+    const recovered = [];
+    for (const job of this.data.processingJobs) {
+      const leaseBoundary = job.leaseExpiresAt || job.processingStartedAt;
+      if (job.status !== "processing" || !leaseBoundary || leaseBoundary >= expiredBefore) continue;
+      job.status = job.processingAttempts < job.maxAttempts ? "queued" : "dead_letter";
+      job.lastProcessingError = "Recovered after an expired worker lease.";
+      job.nextRetryAt = null;
+      job.processingCompletedAt = job.status === "dead_letter" ? nowIso() : null;
+      job.deadLetteredAt = job.status === "dead_letter" ? nowIso() : null;
+      job.workerId = null;
+      job.leaseToken = null;
+      job.leaseExpiresAt = null;
+      job.heartbeatAt = null;
+      job.updatedAt = nowIso();
+      changed = true;
+      recovered.push({ ...job });
+    }
+    if (changed) await this.persist();
+    return recovered;
+  }
+
+  async completeProcessingJob(organizationId, id, leaseToken) {
+    const job = await this.getProcessingJob(organizationId, id);
+    if (job.status !== "processing" || job.leaseToken !== leaseToken) throw leaseLostError(id);
+    Object.assign(job, { status: "completed", processingCompletedAt: nowIso(), lastProcessingError: null, workerId: null, leaseToken: null, leaseExpiresAt: null, heartbeatAt: null, updatedAt: nowIso() });
+    await this.persist();
+    return { ...job };
+  }
+
+  async failProcessingJob(organizationId, id, { error, retryAt = null, leaseToken }) {
+    const job = await this.getProcessingJob(organizationId, id);
+    if (job.status !== "processing" || job.leaseToken !== leaseToken) throw leaseLostError(id);
+    Object.assign(job, {
+      status: retryAt ? "queued" : "dead_letter",
+      lastProcessingError: String(error || "Processing failed").slice(0, 500),
+      nextRetryAt: retryAt,
+      processingCompletedAt: retryAt ? null : nowIso(),
+      deadLetteredAt: retryAt ? null : nowIso(),
+      workerId: null,
+      leaseToken: null,
+      leaseExpiresAt: null,
+      heartbeatAt: null,
+      updatedAt: nowIso()
+    });
+    await this.persist();
+    return { ...job };
+  }
+
+  async getProcessingQueueMetrics() {
+    return this.data.processingJobs.reduce((metrics, job) => ({ ...metrics, [job.status]: (metrics[job.status] || 0) + 1 }), {});
   }
 
   async applyAiHumanReview(input) {
@@ -348,18 +550,27 @@ export class FileRepository {
     const review = await this.getReview(input.organizationId, input.reviewId);
     if (review.facilityId !== facility.id) throw forbidden("Review does not belong to this facility");
     if (input.rulesPackId !== review.rulesPackId) throw forbidden("Packet rules pack does not match the review rules pack");
-    const row = { id: input.id || this.createId(), generatedAt: nowIso(), ...input };
+    const row = { id: input.id || this.createId(), generatedAt: nowIso(), archived: false, storageDeletionStatus: "retained", ...input };
     this.data.auditPackets.push(row);
     await this.persist();
     return row;
   }
 
   async listAuditPackets(organizationId, facilityId = null) {
-    return this.data.auditPackets.filter((row) => row.organizationId === organizationId && (!facilityId || row.facilityId === facilityId));
+    return this.data.auditPackets.filter((row) => row.organizationId === organizationId && !row.archived && (!facilityId || row.facilityId === facilityId));
   }
 
   async getAuditPacket(organizationId, id) {
     return this.getScoped("auditPackets", organizationId, id, "Audit packet");
+  }
+
+  async archiveAuditPacket(organizationId, id, deletion = {}) {
+    const row = await this.getAuditPacket(organizationId, id);
+    if (deletion.deletedByUserId) await this.assertUserOrganization(deletion.deletedByUserId, organizationId, "Deletion actor");
+    Object.assign(row, { archived: deletion.archived ?? true, ...deletion });
+    if (row.storageDeletionStatus === "deleted") row.fileReference = null;
+    await this.persist();
+    return row;
   }
 
   async createExpertReview(input) {
@@ -396,10 +607,23 @@ export class FileRepository {
     return this.data.auditLogs.filter((row) => row.organizationId === organizationId && (!facilityId || row.facilityId === facilityId));
   }
 
+  async assertUserOrganization(userId, organizationId, label = "User") {
+    const user = await this.findUserById(userId);
+    if (!user || user.organizationId !== organizationId) throw forbidden(`${label} does not belong to this organization`);
+    return user;
+  }
+
   async getScoped(table, organizationId, id, label) {
     const row = this.data[table].find((item) => item.id === id);
     if (!row) return null;
     if (row.organizationId !== organizationId) throw forbidden(`${label} belongs to another organization`);
     return row;
   }
+}
+
+function leaseLostError(id) {
+  const error = new Error(`Processing job lease was lost for ${id}`);
+  error.code = "JOB_LEASE_LOST";
+  error.retryable = false;
+  return error;
 }

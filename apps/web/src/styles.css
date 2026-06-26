@@ -299,6 +299,75 @@ textarea {
   background: var(--danger);
 }
 
+.processing-row {
+  justify-content: flex-start;
+}
+
+.processing-error {
+  margin: 0;
+  padding: 9px 11px;
+  border-radius: 6px;
+  background: #fffbfa;
+  color: var(--danger);
+  font-size: 0.88rem;
+}
+
+.review-queue-panel {
+  border-top: 4px solid var(--accent);
+}
+
+.queue-heading, .queue-card-summary {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.queue-heading p, .queue-card-summary span {
+  margin: 0;
+}
+
+.queue-filters {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(160px, 1fr));
+  gap: 10px;
+  min-width: min(380px, 100%);
+}
+
+.review-queue-list {
+  display: grid;
+  gap: 12px;
+  margin-top: 18px;
+}
+
+.review-queue-card {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 14px;
+  display: grid;
+  gap: 10px;
+  background: #fafbfc;
+}
+
+.review-queue-card p, .review-queue-card ul {
+  margin: 0;
+}
+
+.queue-card-summary > div:first-child {
+  display: grid;
+  gap: 4px;
+}
+
+.queue-card-summary span {
+  color: var(--muted);
+  font-size: 0.86rem;
+}
+
+.blocked-card {
+  border-color: #fda29b;
+  background: #fffbfa;
+}
+
 .matrix-ai {
   display: grid;
   gap: 2px;
@@ -406,12 +475,12 @@ tr.critical td:first-child {
     position: static;
   }
 
-  .topbar, .builder-band {
+  .topbar, .builder-band, .queue-heading, .queue-card-summary {
     align-items: stretch;
     flex-direction: column;
   }
 
-  .compact, .checks, .ai-review-form {
+  .compact, .checks, .ai-review-form, .queue-filters {
     grid-template-columns: 1fr;
   }
 }

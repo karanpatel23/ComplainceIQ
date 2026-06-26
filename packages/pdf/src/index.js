@@ -3,8 +3,10 @@ const AI_DISCLAIMER = "AI-assisted evidence analysis is provided for audit-prepa
 
 export function buildAuditPacketLines({ facility, review, gapRows, actionItems, evidence, rulesPack, findings, aiAnalyses = [] }) {
   const criticalMissing = gapRows.filter((row) => row.priority === "critical" && row.status !== "accepted");
-  const acceptedEvidence = evidence.filter((item) => item.status === "accepted");
+  const acceptedEvidence = evidence.filter((item) => item.status === "accepted" && item.scanStatus !== "scan_suspicious");
   const expiredRejected = evidence.filter((item) => ["expired", "rejected"].includes(item.status));
+  const suspiciousEvidence = evidence.filter((item) => item.scanStatus === "scan_suspicious");
+  const unresolvedAnalyses = aiAnalyses.filter((item) => item.needsHumanReview || ["failed", "needs_review"].includes(item.processingStatus) || ["ocr_required", "extraction_failed"].includes(item.textExtractionStatus));
   const lines = [
     "Industrial Audit Readiness Packet",
     `Facility: ${facility.name}`,
@@ -30,6 +32,12 @@ export function buildAuditPacketLines({ facility, review, gapRows, actionItems, 
     `${review.summary.missingEvidenceCount} missing evidence rows`,
     `${review.summary.criticalGapsCount} critical gaps`,
     `${review.summary.demoRulesCount} demo or unverified rules`,
+    "",
+    "Processing and Review Summary",
+    `${aiAnalyses.filter((item) => item.processingStatus === "processed").length} evidence analyses processed`,
+    `${unresolvedAnalyses.length} unresolved review items`,
+    `${suspiciousEvidence.length} suspicious or blocked evidence files`,
+    ...unresolvedAnalyses.map((item) => `${evidence.find((entry) => entry.id === item.evidenceId)?.title || item.evidenceId}: ${item.textExtractionStatus} / ${item.processingStatus}`),
     "",
     "Evidence Gap Matrix",
     ...gapRows.map((row) => `${row.priority.toUpperCase()} | ${row.status} | ${row.authority} ${row.citation} | ${row.obligationTitle} | Required: ${row.requiredEvidence.join(", ")}`),
@@ -71,9 +79,7 @@ export function generateAuditPacketPdf(data) {
 }
 
 function createSimplePdf(lines) {
-  const printableLines = lines.flatMap((raw) => wrap(ascii(String(raw)), 92));
-  const pageChunks = [];
-  for (let index = 0; index < printableLines.length; index += 47) pageChunks.push(printableLines.slice(index, index + 47));
+  const pageChunks = paginateSections(lines, 52);
   if (pageChunks.length === 0) pageChunks.push([""]);
 
   const objects = [];
@@ -114,6 +120,34 @@ function createSimplePdf(lines) {
   return Buffer.from(parts.join(""), "utf8");
 }
 
+function paginateSections(lines, maxLines) {
+  const pages = [[]];
+  let block = [];
+  const current = () => pages[pages.length - 1];
+  const newPage = () => pages.push([]);
+  const appendBlock = () => {
+    if (block.length === 0) return;
+    const printable = block.flatMap((raw) => wrap(ascii(String(raw)), 92));
+    if (printable.length <= maxLines) {
+      if (current().length > 0 && current().length + printable.length > maxLines) newPage();
+      current().push(...printable);
+    } else {
+      for (const line of printable) {
+        if (current().length >= maxLines) newPage();
+        current().push(line);
+      }
+    }
+    if (current().length < maxLines) current().push("");
+    block = [];
+  };
+  for (const line of lines) {
+    if (line === "") appendBlock();
+    else block.push(line);
+  }
+  appendBlock();
+  return pages.filter((page) => page.length > 0);
+}
+
 function escapePdfText(text) {
   return text.replace(/\\/g, "\\\\").replace(/\(/g, "\\(").replace(/\)/g, "\\)");
 }
@@ -150,13 +184,17 @@ function lineageLines(analysis, evidence, gapRows) {
   });
   return [
     `Evidence: ${evidenceItem?.title || analysis.evidenceId}`,
+    `Evidence status: ${evidenceItem?.status || "unknown"} | Scan: ${evidenceItem?.scanStatus || "scan_unavailable"}`,
+    `Analysis version: ${analysis.analysisVersion || 1} | Job: ${analysis.processingJobId || "manual/legacy"} | Extraction: ${analysis.textExtractionStatus}`,
     `Detected type: ${analysis.detectedEvidenceType || "Not classified"} | Confidence: ${analysis.confidence ?? "N/A"} | Processing: ${analysis.processingStatus}`,
     `Extracted dates: document ${analysis.extractedDocumentDate || "unknown"}; expiration ${analysis.extractedExpirationDate || "unknown"}`,
     `Extracted fields: employees ${(analysis.extractedEmployeeNames || []).join(", ") || "none"}; equipment ${(analysis.extractedEquipmentNames || []).join(", ") || "none"}; chemicals ${(analysis.extractedChemicalNames || []).join(", ") || "none"}; signature ${analysis.extractedSignaturePresent === null || analysis.extractedSignaturePresent === undefined ? "unknown" : analysis.extractedSignaturePresent ? "present" : "not detected"}`,
     `Suggested obligation: ${analysis.suggestedObligationTitle || "None"} | Reason: ${analysis.matchReason || "No AI match reason"}`,
     `Final matched obligation: ${finalMatches.join("; ") || "No final match"}`,
     `Human review: ${analysis.humanReviewed ? "Human reviewed" : analysis.needsHumanReview ? "Needs human review" : "Not yet human reviewed"}`,
+    `Reviewer notes: ${analysis.humanReviewNotes || evidenceItem?.reviewerNotes || "None"}`,
     `Issues: ${(analysis.issues || []).join("; ") || "None reported"}`,
+    `Remaining action: ${finalRows.filter((row) => row.status !== "accepted").map((row) => row.recommendedAction).filter(Boolean).join("; ") || "No lineage-specific action recorded"}`,
     ""
   ];
 }
